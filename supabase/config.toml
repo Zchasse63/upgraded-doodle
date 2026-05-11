@@ -1,0 +1,61 @@
+# Supabase local-dev configuration for tsg-cc-bridge.
+# A string used to distinguish different Supabase projects on the same host. Defaults to the
+# working directory name when running `supabase init`.
+project_id = "tsg-cc-bridge"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[realtime]
+enabled = false
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = false
+
+[auth]
+# We do not use Supabase Auth in the middleware — the only client of this DB
+# is the Edge Function, which uses the service-role key. Authentication on
+# inbound webhooks is via PushPress's HMAC signature, not Supabase Auth.
+enabled = false
+
+[edge_runtime]
+enabled = true
+ip_version = "ipv4"
+# Single shared function policy. Each function declares its own per_worker
+# request limit when needed.
+policy = "oneshot"
+
+[functions.pushpress-webhook]
+# Webhook endpoint must be reachable without a Supabase JWT — PushPress
+# only sends its own `webhook-signature` header. Set `verify_jwt = false`
+# so the function accepts unauthenticated POSTs; we verify the HMAC
+# signature inside the handler.
+verify_jwt = false
+
+[analytics]
+enabled = false

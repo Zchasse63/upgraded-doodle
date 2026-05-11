@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# Supabase
+supabase/.branches
+supabase/.temp
+supabase/.env
+.supabase/
+
+# Deno / Node
+node_modules/
+.deno/
+deno.lock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.log
+
+# Test artifacts
+coverage/
+.nyc_output/
+
+# Claude Code
+.claude/worktrees/
+.claude/sessions/
