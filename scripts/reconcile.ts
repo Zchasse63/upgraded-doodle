@@ -240,11 +240,15 @@ async function auditReservations(): Promise<ReservationGap[]> {
     activeChecked += active.length;
 
     for (const res of active) {
+      // Gap = no `success` event_log row. Rows in handler_status=failed/
+      // filtered/skipped don't count as mirrored — they're either dropped
+      // or actively need replay. Mirrors auditEnrollments() semantics.
       const { data, error } = await supabase
         .from("event_log")
-        .select("dedup_key")
+        .select("dedup_key, handler_status")
         .eq("pushpress_event", "reservation.created")
         .filter("payload->data->>id", "eq", res.id)
+        .eq("handler_status", "success")
         .limit(1)
         .maybeSingle();
       if (error) {
@@ -267,16 +271,57 @@ async function auditReservations(): Promise<ReservationGap[]> {
 }
 
 async function replayReservation(gap: ReservationGap): Promise<void> {
+  const r = gap.reservation;
+
+  // Replay needs to bypass the dedup gate. Mirrors the enrollment pattern:
+  //
+  // (1) Recover the original `created` from a prior event_log row when one
+  //     exists — keeps dedup_key deterministic per reservation so subsequent
+  //     replay runs of an unchanged reservation collide and return 'duplicate'
+  //     (preventing accidental double-booking in Glofox).
+  // (2) DELETE that prior row. Safe because gap detection has already proven
+  //     no `success` row exists — only failed/filtered/skipped/duplicate.
+  // (3) POST the synthetic webhook so the handler re-runs end-to-end.
+
+  const { data: prior } = await supabase
+    .from("event_log")
+    .select("dedup_key, payload")
+    .eq("pushpress_event", "reservation.created")
+    .filter("payload->data->>id", "eq", r.id)
+    .limit(1)
+    .maybeSingle();
+
+  let createdTs: number;
+  if (prior?.payload && typeof prior.payload === "object") {
+    const priorCreated = (prior.payload as { created?: unknown }).created;
+    createdTs = typeof priorCreated === "number"
+      ? priorCreated
+      : r.registrationTimestamp;
+    if (prior.dedup_key) {
+      const { error } = await supabase
+        .from("event_log")
+        .delete()
+        .eq("dedup_key", prior.dedup_key);
+      if (error) {
+        console.error(`    WARN: failed to delete prior event_log row: ${error.message}`);
+      } else {
+        console.log(`    deleted prior event_log row (will be replaced by replay)`);
+      }
+    }
+  } else {
+    createdTs = r.registrationTimestamp;
+  }
+
   const body = {
     event: "reservation.created",
-    created: gap.reservation.registrationTimestamp,
+    created: createdTs,
     data: {
-      id: gap.reservation.id,
-      reservedId: gap.reservation.reservedId,
-      customerId: gap.reservation.customerId,
-      companyId: gap.reservation.companyId,
-      registrationTimestamp: gap.reservation.registrationTimestamp,
-      status: gap.reservation.status,
+      id: r.id,
+      reservedId: r.reservedId,
+      customerId: r.customerId,
+      companyId: r.companyId,
+      registrationTimestamp: r.registrationTimestamp,
+      status: r.status,
     },
   };
   const res = await postSyntheticWebhook(body);

@@ -174,18 +174,29 @@ export class GlofoxClient implements GlofoxClientShape {
     userId: string;
     eventId: string;
   }): Promise<{ _id: string }> {
+    // Glofox requires `model` + `model_id` on POST bookings or returns
+    // 400 MODEL_IS_REQUIRED, MODEL_ID_IS_REQUIRED. The accepted INPUT value
+    // is `"event"` (singular, lowercase); Glofox then stores it as `"events"`
+    // (plural) on the booking record — input/output asymmetry verified via
+    // direct probe 2026-05-11. Sending the plural form (`"events"`) on input
+    // is rejected with `INVALID_MODEL`. `model_id` is the event's `_id`.
     const path = `/2.3/branches/${this.cfg.branchId}/bookings`;
-    const res = await this.request<{ _id?: string; booking?: { id?: string } }>(
-      "POST",
-      path,
-      {
-        user_id: args.userId,
-        event_id: args.eventId,
-        charge: false, // CC bills in PushPress; Glofox must NOT charge
-        pay_gym: false, // do NOT deduct from member's Glofox credits
-      },
-    );
-    const id = res?._id ?? res?.booking?.id;
+    const res = await this.request<{
+      success?: boolean;
+      _id?: string;
+      Booking?: { _id?: string };
+      booking?: { id?: string; _id?: string };
+    }>("POST", path, {
+      user_id: args.userId,
+      event_id: args.eventId,
+      model: "event",
+      model_id: args.eventId,
+      charge: false, // CC bills in PushPress; Glofox must NOT charge
+      pay_gym: false, // do NOT deduct from member's Glofox credits
+    });
+    // Verified shape (2026-05-11): { success: true, Booking: { _id, ... } }.
+    // Keep legacy fallbacks for resilience but prefer `Booking._id` first.
+    const id = res?.Booking?._id ?? res?._id ?? res?.booking?._id ?? res?.booking?.id;
     if (!id) {
       throw new GlofoxApiError(500, path, "booking created but response missing _id");
     }
