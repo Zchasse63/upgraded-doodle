@@ -3,181 +3,163 @@
 // Single entry point for all PushPress webhooks. Dispatches by event name
 // to per-event handlers.
 //
-// STATUS: SCAFFOLD ONLY. No business logic. PR 1 in the next session fills
-// these handlers in following the architect → implement → review pipeline.
-// See ../../docs/pr-1-plan.md.
-//
 // Auth: PushPress signs each payload with HMAC-SHA256 over JSON.stringify(body.data)
-// using the per-subscription signing secret. We verify with the same math.
-// See ../../docs/pushpress/sdk-reference.md § Webhooks.
+// using the per-subscription signing secret. See ../_shared/signature.ts.
 //
-// Idempotency: PushPress retries are undocumented. We dedup via SHA-256 of
-// {event, data.id, data.companyId, created} stored in event_log.
+// Idempotency: dedup via SHA-256 of (event, data.id, data.companyId, created)
+// stored in event_log with a unique constraint. See ../_shared/dedup.ts.
+//
+// Q9: PushPress (CC's instance) contains BOTH CrossFit and Sauna activity.
+// We filter to mirror only sauna class types to TSG's live Glofox. See
+// ../_shared/filter.ts and handlers/reservation-created.ts.
+//
+// PR 1 only implements reservation.created end-to-end. The other 8 handlers
+// remain stubbed as `status: "skipped"`. PR 2 fills them in.
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import type {
+  HandlerResult,
+  PushPressEventName,
+  PushPressWebhookBody,
+} from "../_shared/types.ts";
+import { verifyPushPressSignature } from "../_shared/signature.ts";
+import { computeDedupKey } from "../_shared/dedup.ts";
+import { insertEventLog, updateEventLog } from "../_shared/event-log.ts";
+import { glofoxClientFromEnv } from "../_shared/glofox-client.ts";
+import type { GlofoxClientShape } from "../_shared/types.ts";
+import { PushPressClient } from "../_shared/pushpress-client.ts";
+import { handleReservationCreated } from "./handlers/reservation-created.ts";
+import { handleEnrollmentCreated } from "./handlers/enrollment-created.ts";
 
-// -----------------------------------------------------------------------------
-// Types — these will move into _shared/types.ts in PR 1
-// -----------------------------------------------------------------------------
-
-type PushPressEventName =
-  | "enrollment.created"
-  | "enrollment.status.changed"
-  | "enrollment.deleted"
-  | "reservation.created"
-  | "reservation.canceled"
-  | "reservation.waitlisted"
-  | "checkin.created"
-  | "class.canceled"
-  | "customer.details.changed";
-
-interface PushPressWebhookBody {
-  event: PushPressEventName;
-  created: number; // Unix seconds
-  data: Record<string, unknown>;
-}
-
-interface HandlerResult {
-  status: "success" | "failed" | "skipped";
-  error?: string;
-  glofoxResponse?: unknown;
-}
-
-// -----------------------------------------------------------------------------
-// Bootstrapping
-// -----------------------------------------------------------------------------
+// --- Bootstrapping ----------------------------------------------------------
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const PUSHPRESS_WEBHOOK_SIGNING_SECRET = Deno.env.get("PUSHPRESS_WEBHOOK_SIGNING_SECRET") ?? "";
+const PUSHPRESS_WEBHOOK_SIGNING_SECRET =
+  Deno.env.get("PUSHPRESS_WEBHOOK_SIGNING_SECRET") ?? "";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  // Logged at boot, will fail fast on any request.
-  console.error("[boot] missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  console.error(
+    JSON.stringify({
+      level: "error",
+      msg: "missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY — all requests will fail",
+    }),
+  );
 }
 if (!PUSHPRESS_WEBHOOK_SIGNING_SECRET) {
-  console.error("[boot] missing PUSHPRESS_WEBHOOK_SIGNING_SECRET — all requests will 401");
+  console.error(
+    JSON.stringify({
+      level: "error",
+      msg: "missing PUSHPRESS_WEBHOOK_SIGNING_SECRET — all requests will 401",
+    }),
+  );
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// -----------------------------------------------------------------------------
-// Signature verification — mirrors the SDK's `webhook-security-custom.ts`
-// -----------------------------------------------------------------------------
+// Lazily memoize the external clients at module scope so their rate-limit
+// pacing state is shared across requests in the same Edge Function isolate.
+// First-request init means a missing env var surfaces as a per-request
+// failure (caught by the dispatcher), not a cold-start crash that 500s every
+// inbound webhook. The Glofox client variant is determined by GLOFOX_MODE
+// (mock | readonly | live) — see _shared/glofox-client.ts.
+let _glofox: GlofoxClientShape | undefined;
+let _pushpress: PushPressClient | undefined;
 
-async function verifySignature(rawBody: string, providedSignature: string): Promise<boolean> {
-  // TODO(PR1): implement HMAC-SHA256 over JSON.stringify(body.data) and constant-time compare
-  // Reference: docs/pushpress/sdk-reference.md § Webhooks
-  console.error("[verifySignature] not implemented");
-  return false;
+function glofox(): GlofoxClientShape {
+  if (!_glofox) _glofox = glofoxClientFromEnv();
+  return _glofox;
 }
 
-// -----------------------------------------------------------------------------
-// Idempotency
-// -----------------------------------------------------------------------------
-
-async function dedupKey(body: PushPressWebhookBody): Promise<string> {
-  // TODO(PR1): SHA-256 of `${event}|${data.id}|${data.companyId}|${created}`
-  return "";
+function pushpress(): PushPressClient {
+  if (!_pushpress) _pushpress = PushPressClient.fromEnv();
+  return _pushpress;
 }
 
-// -----------------------------------------------------------------------------
-// Per-event handlers — all TODO. PR 1 implements these.
-// -----------------------------------------------------------------------------
+// --- Handlers ---------------------------------------------------------------
 
-async function handleEnrollmentCreated(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // 1. Resolve PushPress customer → Glofox user (members_link)
-  // 2. If not in members_link: POST /v3.0/namespaces/members/retrieve, fallback to POST /2.1/branches/{id}/leads
-  // 3. Look up plan_mappings for PushPress planId → Glofox membership_id + plan_code + payment_method
-  // 4. POST /2.2/branches/{branch}/users/{userId}/memberships/{membershipId}/plans/{planCode}/purchase
-  //    with payment_method from the mapping (externally-billed)
-  // 5. Store the resulting userMembershipId for later cancel reference
-  return { status: "skipped", error: "handler not implemented" };
+function skipped(_body: PushPressWebhookBody): Promise<HandlerResult> {
+  return Promise.resolve({
+    status: "skipped",
+    error: "handler not implemented (PR 2)",
+  });
 }
 
-async function handleEnrollmentStatusChanged(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // If status becomes 'canceled' → POST /v3.0/memberships/{userMembershipId}/cancel
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleEnrollmentDeleted(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // POST /v3.0/memberships/{userMembershipId}/cancel
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleReservationCreated(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // 1. Lazy resolve Glofox event_id from slot_mappings, falling back to
-  //    GET /2.0/events?date_from=...&date_to=... and caching
-  // 2. POST /2.3/branches/{branch}/bookings with charge:false, pay_gym:false
-  // 3. On capacity error → enqueue to pending_refunds + send PushPress push + Slack alert
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleReservationCanceled(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // DELETE /2.3/branches/{branch}/bookings/{bookingId}
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleReservationWaitlisted(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // POST /2.3/branches/{branch}/bookings with status WAITING
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleCheckinCreated(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // POST /2.0/attendances
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleClassCanceled(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // Fan-out DELETE /2.3/branches/{branch}/bookings/{bookingId} for every linked booking
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-async function handleCustomerDetailsChanged(body: PushPressWebhookBody): Promise<HandlerResult> {
-  // Debounced PUT /2.0/members/{userId} — debouncing happens at the queue layer (PR 2)
-  return { status: "skipped", error: "handler not implemented" };
-}
-
-const HANDLERS: Record<PushPressEventName, (body: PushPressWebhookBody) => Promise<HandlerResult>> = {
-  "enrollment.created": handleEnrollmentCreated,
-  "enrollment.status.changed": handleEnrollmentStatusChanged,
-  "enrollment.deleted": handleEnrollmentDeleted,
-  "reservation.created": handleReservationCreated,
-  "reservation.canceled": handleReservationCanceled,
-  "reservation.waitlisted": handleReservationWaitlisted,
-  "checkin.created": handleCheckinCreated,
-  "class.canceled": handleClassCanceled,
-  "customer.details.changed": handleCustomerDetailsChanged,
+// Typing this against PushPressEventName means adding or removing a subscribed
+// event in types.ts forces a corresponding dispatch-table update.
+const HANDLERS: Record<
+  PushPressEventName,
+  (body: PushPressWebhookBody) => Promise<HandlerResult>
+> = {
+  "enrollment.created": (body) =>
+    handleEnrollmentCreated(body, {
+      supabase,
+      glofox: glofox(),
+      pushpress: pushpress(),
+    }),
+  "enrollment.status.changed": skipped,
+  "enrollment.deleted": skipped,
+  "reservation.created": (body) =>
+    handleReservationCreated(body, {
+      supabase,
+      glofox: glofox(),
+      pushpress: pushpress(),
+    }),
+  "reservation.canceled": skipped,
+  "reservation.waitlisted": skipped,
+  "checkin.created": skipped,
+  "class.canceled": skipped,
+  "customer.details.changed": skipped,
 };
 
-// -----------------------------------------------------------------------------
-// Top-level request handler
-// -----------------------------------------------------------------------------
+function dispatchHandler(
+  event: string,
+  body: PushPressWebhookBody,
+): Promise<HandlerResult> {
+  return event in HANDLERS
+    ? HANDLERS[event as PushPressEventName](body)
+    : Promise.resolve({
+        status: "skipped" as const,
+        error: `unknown event: ${event}`,
+      });
+}
 
-serve(async (req: Request) => {
+// --- Top-level request handler ---------------------------------------------
+
+// PushPress webhook payloads are small (a few KB at most). Cap inbound size
+// to bound memory amplification from a malicious sender flooding large bodies.
+const MAX_BODY_BYTES = 64 * 1024;
+
+// Exported so a local test-driver script (scripts/test-drive.ts) can invoke
+// the handler in-process. Production: `serve(handleRequest)` below.
+export async function handleRequest(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const startedAt = Date.now();
+  const contentLength = Number(req.headers.get("content-length") ?? "0");
+  if (contentLength > MAX_BODY_BYTES) {
+    return new Response("Payload too large", { status: 413 });
+  }
+
+  // 1. Read body.
   let rawBody: string;
   try {
     rawBody = await req.text();
   } catch (err) {
-    console.error("[webhook] failed to read body", err);
+    console.error(
+      JSON.stringify({ level: "error", msg: "failed to read body", err: String(err) }),
+    );
     return new Response("Bad request", { status: 400 });
   }
-
-  const signature = req.headers.get("webhook-signature") ?? "";
-  const signatureValid = await verifySignature(rawBody, signature);
-  if (!signatureValid) {
-    // TODO(PR1): record signature failure in event_log + alert ops
-    return new Response("Invalid signature", { status: 401 });
+  if (rawBody.length > MAX_BODY_BYTES) {
+    // Sender lied about content-length or didn't send the header.
+    return new Response("Payload too large", { status: 413 });
   }
 
+  // 2. Parse JSON.
   let body: PushPressWebhookBody;
   try {
     body = JSON.parse(rawBody);
@@ -185,21 +167,132 @@ serve(async (req: Request) => {
     return new Response("Bad JSON", { status: 400 });
   }
 
-  const handler = HANDLERS[body.event];
-  if (!handler) {
-    // Unhandled event — record but ack so PushPress doesn't retry forever.
-    console.error("[webhook] unhandled event", body.event);
-    // TODO(PR1): record to event_log with status='skipped'
-    return new Response("OK (unhandled event recorded)", { status: 200 });
+  // 3. Verify signature.
+  const providedSignature = req.headers.get("webhook-signature") ?? "";
+  const signatureValid = await verifyPushPressSignature(
+    body,
+    providedSignature,
+    PUSHPRESS_WEBHOOK_SIGNING_SECRET,
+  );
+
+  if (!signatureValid) {
+    // Best-effort audit log of the rejected payload. Don't let a DB outage
+    // block the 401 — security takes priority over logging completeness.
+    try {
+      const dedupKey = await computeDedupKey(body);
+      await insertEventLog(supabase, {
+        dedupKey,
+        event: body.event,
+        companyId: pickCompanyId(body),
+        signatureVerified: false,
+        handlerStatus: "failed",
+        handlerError: "invalid_signature",
+        payload: body,
+      });
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          msg: "event_log insert for invalid signature failed (continuing to 401)",
+          err: String(err),
+        }),
+      );
+    }
+    return new Response("Invalid signature", { status: 401 });
   }
 
-  // TODO(PR1): idempotency check against event_log via dedup_key
-  // TODO(PR1): wrap handler call in event_log INSERT for audit + outcome
-  const result = await handler(body);
-  const _durationMs = Date.now() - startedAt;
+  // 4. Dedup key.
+  const dedupKey = await computeDedupKey(body);
 
-  return new Response(JSON.stringify({ ok: true, status: result.status }), {
+  // 5. Insert pending event_log row — collision means duplicate delivery.
+  let insert: { duplicate: boolean };
+  try {
+    insert = await insertEventLog(supabase, {
+      dedupKey,
+      event: body.event,
+      companyId: pickCompanyId(body),
+      signatureVerified: true,
+      handlerStatus: "pending",
+      payload: body,
+    });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        msg: "event_log insert failed",
+        event: body.event,
+        err: String(err),
+      }),
+    );
+    // Return 200 anyway so PushPress doesn't retry endlessly into a broken DB.
+    return ok({ status: "failed", error: "event_log_unavailable" });
+  }
+
+  if (insert.duplicate) {
+    return ok({ status: "duplicate" });
+  }
+
+  // 6. Dispatch.
+  const startedAt = Date.now();
+  let result: HandlerResult;
+  try {
+    result = await dispatchHandler(body.event, body);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      JSON.stringify({
+        level: "error",
+        msg: "handler threw",
+        event: body.event,
+        err: message,
+      }),
+    );
+    result = { status: "failed", error: message };
+  }
+  const durationMs = Date.now() - startedAt;
+
+  // 7. Record outcome.
+  try {
+    await updateEventLog(supabase, dedupKey, {
+      handlerStatus: result.status,
+      handlerError: result.error,
+      durationMs,
+      glofoxResponse: result.glofoxResponse,
+    });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        msg: "event_log update failed — row stuck at 'pending'",
+        event: body.event,
+        dedup_key: dedupKey,
+        err: String(err),
+      }),
+    );
+  }
+
+  // 8. Always 200 — we own retry behavior via event_log, not via PushPress.
+  return ok({ status: result.status });
+}
+
+// In the Supabase Edge runtime this binds the function's request handler.
+// Test-driver scripts that `import { handleRequest }` from this module will
+// also bind a port at import time; that's harmless (they call handleRequest
+// directly and exit). See scripts/test-drive.ts for the Deno.exit() at end.
+Deno.serve(handleRequest);
+
+// --- Helpers ---------------------------------------------------------------
+
+function pickCompanyId(body: PushPressWebhookBody): string | undefined {
+  const data = body.data as { companyId?: unknown; company?: unknown };
+  if (typeof data.companyId === "string") return data.companyId;
+  if (typeof data.company === "string") return data.company; // checkins use `company`
+  return undefined;
+}
+
+function ok(body: { status: HandlerResult["status"] | "duplicate"; error?: string }): Response {
+  return new Response(JSON.stringify({ ok: true, ...body }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-});
+}

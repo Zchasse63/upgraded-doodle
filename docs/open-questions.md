@@ -6,28 +6,68 @@ Status legend: `OPEN` (no answer yet), `INVESTIGATING` (someone's looking), `ANS
 
 ---
 
+## State change — 2026-05-11
+
+### Test/sandbox topology (current)
+
+The bridge is being developed and tested against **TSG's PushPress sandbox** (company `client_ddd1caa8be7225`, "The Sauna Guys"). TSG ops replicated CC's CrossFit schedule + memberships AND TSG's sauna schedule + memberships into this sandbox to simulate the eventual production state. **CC's real PushPress is OFF LIMITS until everything is stable in the sandbox.**
+
+### Eventual production topology (cutover, later)
+
+Once the bridge is stable, it will be re-pointed at CC's real PushPress. At that point, TSG members will still live in Glofox, and CC members with the sauna add-on will appear in CC's PushPress (with the bridge mirroring their sauna activity to Glofox).
+
+### Three populations
+
+| Member type | Lives in | Books sauna via | Bridge involvement |
+|---|---|---|---|
+| TSG-only (joined Sauna Guys directly) | Glofox only | Glofox | None — bridge ignores them |
+| CC CrossFit member (no sauna add-on) | PushPress only | n/a — doesn't use sauna | Bridge ignores their CF activity |
+| CC CrossFit member with sauna add-on | PushPress (primary) + Glofox (mirrored) | PushPress | **This is what the bridge handles** |
+
+### Implications
+
+- The bridge receives PushPress webhooks for **everything** in the sandbox: CrossFit enrollments, CrossFit reservations, CrossFit check-ins, sauna enrollments, sauna reservations, sauna check-ins. We must filter to mirror only the sauna-related events to Glofox — see **Q9**.
+- **Glofox does NOT have a sandbox layer in our setup.** TSG's Glofox is the live operator system. Even during PushPress-sandbox testing, real Glofox writes are gated on explicit user approval. Tests use mocked `fetch`.
+- Q5 is partially answered on the PushPress side (sauna plans configured in the sandbox); the Glofox side (matching `membership_id` + `plan_code` for each plan) still needs enumeration.
+
+---
+
 ## Q1 — Glofox externally-billed `payment_method` value
 
-**Status**: OPEN — **gating blocker for PR 1**
+**Status**: INVESTIGATING — **gating blocker for PR 1**
 
 **Question**: what value goes in `MembershipPurchaseRequest.payment_method` so Glofox assigns a membership without attempting to charge the customer?
 
 **Context**: CC handles billing in PushPress (on the member's existing card on file). When PushPress fires `enrollment.created`, we POST to `/2.2/branches/.../memberships/.../plans/.../purchase` in Glofox to mirror the assignment. Glofox must NOT attempt to charge — there's no card on file.
 
-**Candidate values to test (in sandbox)**:
-- `complimentary`
-- `external`
-- `cash` (might still record a transaction; unclear)
-- A custom staff-only payment type configured in the Glofox dashboard (need to check if TSG has one)
-- A combination with `promo_code` set to a 100%-off promo
+**Canonical Glofox payment-method IDs** (from the `/Analytics/report` `PaymentsReportRequest.filter.PaymentMethods[].id` schema in the Glofox API guide):
+
+- `cash`
+- `credit_card`
+- `bank_transfer`
+- `paypal`
+- `direct_debit`
+- `complimentary` ← **strongest candidate** (canonical "no-charge" type)
+- `wallet`
+
+`external` is NOT in the canonical list — that was a guess in earlier notes; drop it.
+
+**Why `complimentary` is the strongest candidate**: it's the Glofox-native term for transactions where no money changes hands. Used internally for comped memberships assigned by staff. The purchase endpoint should accept it without triggering a charge flow.
+
+**Backup**: a custom `staff_only: true` payment method configured in TSG's Glofox dashboard. The endpoint `GET /2.1/branches/{branchId}/payment-methods` returns every configured method for the branch with a `staff_only` flag — use this to enumerate what TSG actually has before testing. See [`api-surface.md`](glofox/api-surface.md) § Payment methods.
+
+**Discarded**: `external` (not canonical), `promo_code` with 100%-off (overly complicated, and the plan-purchase endpoint already supports `promo_code: null` alongside `payment_method` so they're orthogonal).
 
 **How to resolve**:
-1. Get the Glofox OpenAPI 2.2 spec — see if `payment_method` has an enum.
-2. Test each candidate in sandbox against a test user with a known membership.
-3. Confirm the assignment succeeded AND no charge attempt was made (check Glofox transactions afterward).
-4. Update `plan_mappings.payment_method` documentation in [`api-surface.md`](glofox/api-surface.md) once known.
+1. Call `GET /2.1/branches/{branchId}/payment-methods` against TSG's branch (read-only, safe with existing creds). Capture the list + flag any `staff_only: true` entries.
+2. Test `payment_method: "complimentary"` against the purchase endpoint with a sandbox user + a known plan/membership pairing.
+3. Confirm the assignment succeeded (user's `embedded membership` reflects the new plan) AND no charge attempt was recorded (check `/Analytics/report` filtered to the test user immediately after).
+4. If `complimentary` fails or records a charge, fall through to the next `staff_only: true` method from step 1.
+5. Document the winning value in [`api-surface.md`](glofox/api-surface.md) § Memberships and update `plan_mappings.payment_method` notes in [`../supabase/migrations/0001_initial.sql`](../supabase/migrations/0001_initial.sql).
 
 **Owner**: next implementation session, as first PR 1 task.
+
+**Source**: Glofox API guide at `/Users/zach/Desktop/literal-fishstick/glofox-api-guide.md` (last verified against `https://apidocs-plat.aws.glofox.com/openapi.yaml` on 2026-04-05).
 
 ---
 
@@ -79,21 +119,24 @@ Status legend: `OPEN` (no answer yet), `INVESTIGATING` (someone's looking), `ANS
 
 ---
 
-## Q5 — Sauna add-on memberships configured in Glofox
+## Q5 — Glofox memberships matching the unified PushPress plans
 
-**Status**: OPEN — operational, not code
+**Status**: INVESTIGATING — PushPress side complete (2026-05-11), Glofox side pending
 
-**Question**: have the Glofox memberships that mirror PushPress's Sauna add-on plans been created in the Glofox dashboard? If not, what are the exact name + billing variants?
+**Question**: for each PushPress sauna plan that now lives in the unified PushPress space, what is the matching Glofox `membership_id` + `plan_code` that we POST to in `/2.2/.../purchase`?
 
-**Context**: `plan_mappings` needs the Glofox `membership_id` + `plan_code` for each variant. CC's plans (from the original handoff doc) are:
-- Recurring monthly unlimited Sauna add-on
-- Recurring 4-pack (credit-based) Sauna add-on
+**Context**: PushPress now holds all memberships (both CrossFit and Sauna). The bridge mirrors sauna-related ones only (see [Q9](#q9--filtering-sauna-events-out-of-the-unified-pushpress-feed)). Each PushPress sauna plan needs a row in `plan_mappings` with:
+- `pushpress_plan_id` — UUID from PushPress
+- `glofox_membership_id` — Mongo ObjectID from Glofox
+- `glofox_plan_code` — string from Glofox
+- `payment_method` — value from [Q1](#q1--glofox-externally-billed-payment_method-value)
 
-These need matching Glofox memberships. Glofox doesn't have a separate "credit pack" write API, so the 4-pack is modeled as a credit-based membership.
+**How to resolve**:
+1. Get the list of sauna plan IDs from PushPress (`GET /plans/{id}` per plan, or extract from `customers` / `enrollments` data).
+2. Get the list of Glofox memberships (`GET /2.0/memberships`).
+3. Build a one-time mapping spreadsheet, seed `plan_mappings` via SQL migration.
 
-**How to resolve**: TSG / CC ops configures the memberships in Glofox dashboard, then provides the IDs/codes for `plan_mappings`.
-
-**Owner**: TSG ops.
+**Owner**: TSG ops to confirm the PushPress plan IDs; implementation session to fetch the Glofox membership IDs and seed the table.
 
 ---
 
@@ -117,15 +160,13 @@ These need matching Glofox memberships. Glofox doesn't have a separate "credit p
 
 ## Q7 — Other sauna slot types
 
-**Status**: OPEN — low priority
+**Status**: OPEN — folded into Q9
 
 **Question**: are there sauna slot variants we need to handle (different durations, different events like "Cold Plunge Only" vs "Full Contrast", staff-led vs self-serve), or just one standard sauna slot type?
 
-**Context**: affects how generic the slot mapping logic needs to be. If everything is one standard 50-minute sauna class, we can hardcode the class type filter. If there are multiple variants, we need a more general filter.
+**Context**: now that the PushPress schedule is unified, this question is subsumed by Q9 (filtering sauna events). Whatever scheme we use to distinguish sauna from CrossFit will also enumerate the sauna variants. Keep this entry as a pointer until Q9 is answered, then archive.
 
-**How to resolve**: ask TSG ops; review the published PushPress class schedule once CC publishes it.
-
-**Owner**: TSG ops / next implementation session to confirm before writing the slot resolver.
+**Owner**: TSG ops / next implementation session — answer as part of Q9.
 
 ---
 
@@ -143,6 +184,68 @@ These need matching Glofox memberships. Glofox doesn't have a separate "credit p
 - Time-of-day patterns
 
 **Owner**: post-launch retrospective.
+
+---
+
+## Q9 — Filtering sauna events out of the unified PushPress feed
+
+**Status**: OPEN — **new (2026-05-11), now a PR 1 concern**
+
+**Question**: now that PushPress holds both the CrossFit and Sauna schedules + memberships in one space, how does the bridge identify which events belong to "sauna" and should mirror to Glofox? CrossFit events must be silently dropped.
+
+**Context**: PushPress webhooks fire for every reservation, enrollment, check-in, etc. across the entire company. Mirroring everything would pollute Glofox with CF data and break TSG's existing sauna-only reports. We need a deterministic filter — a single source of truth for "is this a sauna event?" — applied at the dispatcher layer before any handler runs.
+
+**Candidate filter strategies** (in rough order of preference):
+
+1. **Class-type allowlist** — maintain a list of PushPress `classTypeName` values (or their underlying `typeId`s) that are "sauna" (e.g. `"Sauna - 50min"`, `"Cold Plunge"`, `"Contrast Therapy"`). Look up `Class.classTypeName` on each reservation / checkin and skip if not in the list. **Tradeoff**: needs maintenance whenever a new sauna class type is added in PushPress.
+
+2. **Plan allowlist** — maintain a list of PushPress `plan_id`s that are sauna plans (recurring monthly, 4-pack, etc.). On enrollment events, check directly; on reservation events, resolve the customer's active enrollment first. **Tradeoff**: requires a lookup per event, and reservations don't carry the customer's plan directly. Possibly too indirect.
+
+3. **Location-based** — if sauna classes happen at a separate PushPress `locationUuid`, filter on that. **Tradeoff**: assumes TSG ops actually configured a separate location. Need confirmation.
+
+4. **Program/category** — if PushPress exposes a class category or program, filter on it. Unclear if it does for `Class.id` lookups; the SDK exposes a `class.type` discriminator but no program field.
+
+**Recommendation for PR 1**: implement strategy 1 (class-type allowlist), seeded via a new column on the `slot_mappings` table or a new `event_filters` table. Start with a single string allowlist held in env / a small mapping table, refactor later if it grows.
+
+**Action items for this session**:
+1. Get the list of CrossFit class type names + sauna class type names from PushPress (operator can provide, or fetch via `pushPress.classes.type.list()`).
+2. Add a filter step to the dispatcher in `pushpress-webhook/index.ts` before idempotency / handler dispatch.
+3. Record filtered-out events to `event_log` with `handler_status='skipped'` and a reason — that way we have an audit trail of "no, we deliberately did not mirror this CF event".
+
+**Owner**: this implementation session, as part of PR 1 architecture.
+
+---
+
+## Q10 — Replay staleness detection
+
+**Status**: OPEN — deferred from PR 1 (security review flagged 2026-05-11)
+
+**Question**: PushPress webhook headers don't include a `webhook-timestamp` field. Our `event_log.dedup_key` (which includes `created` in Unix seconds) gives functional replay protection — a captured signed payload, replayed days later, collides on insert and is silently `duplicate`-acked without re-running the handler. But we get no signal that a replay is happening.
+
+**Recommendation from security review**: after a `23505` dedup collision, look up the original `event_log.received_at`. If `now() - received_at > 24 hours`, emit a structured-log warning so ops can see replay patterns.
+
+**Why deferred**: not a correctness issue. The dedup mechanism does what it needs to. Staleness detection is an observability enhancement, not a fix.
+
+**Owner**: PR 2 or later, optional.
+
+---
+
+## Q11 — Retention policy for `event_log.payload`
+
+**Status**: OPEN — deferred from PR 1 (security review flagged 2026-05-11)
+
+**Question**: `event_log.payload` stores the full webhook body as JSONB indefinitely. Each `reservation.created` payload contains `customerId` (a PushPress UUID — not PII on its own but it correlates to a real person who can be looked up via the API). What's the retention policy?
+
+**Options**:
+1. **Indefinite retention** — current. Useful for debugging, ops review, long-tail replay analysis. Storage cost grows linearly.
+2. **TTL-based pruning** — scheduled job (pgcron or Supabase function on a schedule) sets `payload = NULL` after N days while keeping the audit metadata (`dedup_key`, `handler_status`, `received_at`).
+3. **Field-level redaction** — store only `{event, data.id, data.companyId, created}` from the start, drop the full body.
+
+**Recommendation**: Option 2 with N=90 days. Preserves debugging value while bounding the PII surface.
+
+**Why deferred**: needs an ops decision (90 days is a guess, not policy). Doesn't affect correctness or PR 1 functionality.
+
+**Owner**: TSG ops to set retention period; implementation session to write the prune job.
 
 ---
 

@@ -95,10 +95,7 @@ Content-Type: application/json
 - `membershipId` — from `plan_mappings`
 - `planCode` — from `plan_mappings` (Glofox memberships have variant codes for different billing schedules)
 
-**Critical**: the `payment_method` value determines whether Glofox tries to charge. Candidate values (need sandbox verification):
-- `complimentary` — possibly accepts any membership with no charge
-- `external` — explicit "externally billed" marker
-- A custom staff-only payment type configured in the Glofox dashboard
+**Critical**: the `payment_method` value determines whether Glofox tries to charge. Canonical Glofox payment-method IDs (from the `/Analytics/report` schema): `cash`, `credit_card`, `bank_transfer`, `paypal`, `direct_debit`, `complimentary`, `wallet`. **Strongest candidate for externally-billed: `complimentary`** (Glofox's native "no-charge" type). Backup: any `staff_only: true` method configured for TSG's branch — enumerate via the [Payment methods](#payment-methods) endpoint below.
 
 This is [**open question Q1**](../open-questions.md), the gating blocker for PR 1.
 
@@ -119,13 +116,14 @@ POST /v3.0/memberships/{userMembershipId}/cancel
 ### Resolve event by start time (lazy slot mapping)
 
 ```
-GET /2.0/events?date_from=1715443200&date_to=1715446800
+GET /2.0/events?start=1715443200&end=1715446800
 ```
 
 **Use case**: first time we see a PushPress reservation for a given calendar item, find the matching Glofox event so we can cache the mapping.
 
 **Query params**:
-- `date_from` / `date_to` — Unix seconds, narrow window around the PushPress class start time (e.g. ±60 seconds)
+- `start` / `end` — Unix seconds, narrow window around the PushPress class start time (e.g. ±60 seconds)
+- **WARNING**: Glofox **silently ignores** the older `date_from`/`date_to` names that some PushPress-side docs referenced. With wrong param names you get a default page of today's events with no error — verified 2026-05-11 against the TSG branch. Always use `start`/`end`. The slot resolver also validates the returned event's `time_start` falls within the requested window as defense in depth.
 
 **Notes**:
 - Caller filters the response by class type (sauna vs. cold plunge vs. yoga) since multiple events may overlap.
@@ -174,6 +172,25 @@ DELETE /2.3/branches/{branchId}/bookings/{bookingId}
 
 ---
 
+## Payment methods
+
+### List configured payment methods
+
+```
+GET /2.1/branches/{branchId}/payment-methods
+```
+
+**Use case**: enumerate the payment methods configured for TSG's branch. Needed to pick the right `payment_method` value for externally-billed membership assignments ([Q1](../open-questions.md)) and to know which methods are restricted to staff/integrator use.
+
+**Response fields**: `_id`, `branch_id`, `active`, `staff_only`, `type_id`, `provider` (`name`, `charge_percentage`, `fixed_charge`, `publishable_key`, `account_id`, `tokenization_handler`), `iframe` (`parameters`, `domain`, `full_path`).
+
+**Notes**:
+- `staff_only: true` flags methods only callable by staff/integrator credentials (e.g. a comped-membership type a staff member would assign manually). These are the prime candidates for our externally-billed flow.
+- Canonical Glofox method IDs that may appear: `cash`, `credit_card`, `bank_transfer`, `paypal`, `direct_debit`, `complimentary`, `wallet`. Custom methods configured in the dashboard appear here too.
+- Read-only call — safe to run against production creds during Q1 investigation.
+
+---
+
 ## Attendance
 
 ### Mark a check-in
@@ -210,5 +227,6 @@ Content-Type: application/json
 | `POST` | `/2.3/branches/{branchId}/bookings` | `reservation.created`, `reservation.waitlisted` |
 | `DELETE` | `/2.3/branches/{branchId}/bookings/{bookingId}` | `reservation.canceled`, `class.canceled` |
 | `POST` | `/2.0/attendances` | `checkin.created` |
+| `GET` | `/2.1/branches/{branchId}/payment-methods` | one-shot Q1 probe (not a runtime handler) |
 
-9 events, 9 endpoint patterns. Roughly 1:1 (some events share endpoints — bookings is reused for create/waitlist/cancel).
+9 events, 9 endpoint patterns. Roughly 1:1 (some events share endpoints — bookings is reused for create/waitlist/cancel). The payment-methods endpoint is a tooling-only call used once during Q1 resolution, not a runtime handler dependency.
