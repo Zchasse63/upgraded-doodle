@@ -57,6 +57,12 @@ export interface SlotMapping {
 //   live     — full real client. Phase C and production.
 export type GlofoxMode = "mock" | "readonly" | "live";
 
+export interface GlofoxMembershipSummary {
+  _id: string;            // userMembershipId — what cancelMembership takes
+  membership_id: string;  // the plan-level membership_id (e.g. NOEQL's _id)
+  status: string;         // ACTIVE, CANCELED, PAUSED, etc.
+}
+
 export interface GlofoxClientShape {
   retrieveMemberByEmail(email: string): Promise<{ _id: string } | null>;
   createLead(args: {
@@ -70,6 +76,8 @@ export interface GlofoxClientShape {
     dateTo: number,
   ): Promise<Array<{ _id: string; time_start: number; name?: string }>>;
   createBooking(args: { userId: string; eventId: string }): Promise<{ _id: string }>;
+  createBookingWaitlisted(args: { userId: string; eventId: string }): Promise<{ _id: string }>;
+  cancelBooking(bookingId: string): Promise<void>;
   purchaseMembership(args: {
     userId: string;
     membershipId: string;
@@ -78,6 +86,20 @@ export interface GlofoxClientShape {
     promoCode?: string;
     startDate: string;
   }): Promise<{ userMembershipId: string | null }>;
+  cancelMembership(userMembershipId: string): Promise<void>;
+  getMemberMemberships(userId: string): Promise<GlofoxMembershipSummary[]>;
+  markAttendance(args: {
+    userId: string;
+    eventId: string;
+    attendedAt: number;
+  }): Promise<void>;
+  updateMember(args: {
+    userId: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone?: string | null;
+  }): Promise<void>;
 }
 
 export interface PlanMapping {

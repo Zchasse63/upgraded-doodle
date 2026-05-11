@@ -57,5 +57,13 @@ policy = "oneshot"
 # signature inside the handler.
 verify_jwt = false
 
+[functions.reconcile-cron]
+# Scheduled safety-net audit. Bearer-token auth via CRON_SECRET inside the
+# function (no JWT). Runs daily at 6 AM UTC, posts a Slack summary if gaps
+# are detected. Schedule is interpreted by Supabase's pg_cron-backed
+# scheduler; can also be invoked manually via curl.
+verify_jwt = false
+schedule = "0 6 * * *"
+
 [analytics]
 enabled = false

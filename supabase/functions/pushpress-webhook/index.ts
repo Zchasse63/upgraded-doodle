@@ -29,7 +29,15 @@ import { glofoxClientFromEnv } from "../_shared/glofox-client.ts";
 import type { GlofoxClientShape } from "../_shared/types.ts";
 import { PushPressClient } from "../_shared/pushpress-client.ts";
 import { handleReservationCreated } from "./handlers/reservation-created.ts";
+import { handleReservationCanceled } from "./handlers/reservation-canceled.ts";
+import { handleReservationWaitlisted } from "./handlers/reservation-waitlisted.ts";
+import { handleClassCanceled } from "./handlers/class-canceled.ts";
 import { handleEnrollmentCreated } from "./handlers/enrollment-created.ts";
+import { handleEnrollmentStatusChanged } from "./handlers/enrollment-status-changed.ts";
+import { handleEnrollmentDeleted } from "./handlers/enrollment-deleted.ts";
+import { handleCheckinCreated } from "./handlers/checkin-created.ts";
+import { handleCustomerDetailsChanged } from "./handlers/customer-details-changed.ts";
+import { alertOps } from "../_shared/slack.ts";
 
 // --- Bootstrapping ----------------------------------------------------------
 
@@ -80,13 +88,6 @@ function pushpress(): PushPressClient {
 
 // --- Handlers ---------------------------------------------------------------
 
-function skipped(_body: PushPressWebhookBody): Promise<HandlerResult> {
-  return Promise.resolve({
-    status: "skipped",
-    error: "handler not implemented (PR 2)",
-  });
-}
-
 // Typing this against PushPressEventName means adding or removing a subscribed
 // event in types.ts forces a corresponding dispatch-table update.
 const HANDLERS: Record<
@@ -99,19 +100,30 @@ const HANDLERS: Record<
       glofox: glofox(),
       pushpress: pushpress(),
     }),
-  "enrollment.status.changed": skipped,
-  "enrollment.deleted": skipped,
+  "enrollment.status.changed": (body) =>
+    handleEnrollmentStatusChanged(body, { supabase, glofox: glofox() }),
+  "enrollment.deleted": (body) =>
+    handleEnrollmentDeleted(body, { supabase, glofox: glofox() }),
   "reservation.created": (body) =>
     handleReservationCreated(body, {
       supabase,
       glofox: glofox(),
       pushpress: pushpress(),
     }),
-  "reservation.canceled": skipped,
-  "reservation.waitlisted": skipped,
-  "checkin.created": skipped,
-  "class.canceled": skipped,
-  "customer.details.changed": skipped,
+  "reservation.canceled": (body) =>
+    handleReservationCanceled(body, { supabase, glofox: glofox() }),
+  "reservation.waitlisted": (body) =>
+    handleReservationWaitlisted(body, {
+      supabase,
+      glofox: glofox(),
+      pushpress: pushpress(),
+    }),
+  "checkin.created": (body) =>
+    handleCheckinCreated(body, { supabase, glofox: glofox() }),
+  "class.canceled": (body) =>
+    handleClassCanceled(body, { supabase, glofox: glofox() }),
+  "customer.details.changed": (body) =>
+    handleCustomerDetailsChanged(body, { supabase, glofox: glofox() }),
 };
 
 function dispatchHandler(
@@ -198,6 +210,11 @@ export async function handleRequest(req: Request): Promise<Response> {
         }),
       );
     }
+    // Slack alert on signature failures — throttled inside alertOps, so a
+    // mass-replay attack only generates one or two alerts before suppression.
+    alertOps(supabase, body.event ?? "<unknown_event>", {
+      reason: "invalid_signature",
+    }).catch(() => {}); // fire-and-forget; never block the 401
     return new Response("Invalid signature", { status: 401 });
   }
 
@@ -229,6 +246,9 @@ export async function handleRequest(req: Request): Promise<Response> {
   }
 
   if (insert.duplicate) {
+    // Q10: emit a warning if this is a replay of a stale (>24h old) original.
+    // Fire-and-forget — never let the staleness query block the 200 OK.
+    void emitStaleReplayWarningIfNeeded(dedupKey, body.event);
     return ok({ status: "duplicate" });
   }
 
@@ -282,6 +302,38 @@ export async function handleRequest(req: Request): Promise<Response> {
 Deno.serve(handleRequest);
 
 // --- Helpers ---------------------------------------------------------------
+
+const STALE_REPLAY_THRESHOLD_SECONDS = 86400;
+
+async function emitStaleReplayWarningIfNeeded(
+  dedupKey: string,
+  event: string,
+): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from("event_log")
+      .select("received_at")
+      .eq("dedup_key", dedupKey)
+      .maybeSingle();
+    if (!data?.received_at) return;
+    const ageSeconds = (Date.now() - new Date(data.received_at).getTime()) / 1000;
+    if (ageSeconds > STALE_REPLAY_THRESHOLD_SECONDS) {
+      console.error(JSON.stringify({
+        level: "warn",
+        msg: "stale_replay_detected",
+        event,
+        age_seconds: Math.floor(ageSeconds),
+        original_received_at: data.received_at,
+      }));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({
+      level: "warn",
+      msg: "stale_replay_check_failed",
+      err: err instanceof Error ? err.message : String(err),
+    }));
+  }
+}
 
 function pickCompanyId(body: PushPressWebhookBody): string | undefined {
   const data = body.data as { companyId?: unknown; company?: unknown };

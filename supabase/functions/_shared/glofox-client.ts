@@ -12,7 +12,12 @@
 // stub `fetch` via dependency injection or module mocking. There is no
 // sandbox layer between this client and real customer data.
 
-import type { GlofoxClientShape, GlofoxConfig, GlofoxMode } from "./types.ts";
+import type {
+  GlofoxClientShape,
+  GlofoxConfig,
+  GlofoxMembershipSummary,
+  GlofoxMode,
+} from "./types.ts";
 
 const DEFAULT_BASE_URL = "https://gf-api.aws.glofox.com/prod";
 const INTER_CALL_DELAY_MS = 200;
@@ -203,6 +208,49 @@ export class GlofoxClient implements GlofoxClientShape {
     return { _id: id };
   }
 
+  async createBookingWaitlisted(args: {
+    userId: string;
+    eventId: string;
+  }): Promise<{ _id: string }> {
+    // Same as createBooking but adds status:"WAITING" to land on the waitlist
+    // rather than as a confirmed booking. Glofox waitlist field is documented
+    // in api-surface.md but unverified end-to-end — log the response shape so
+    // we can confirm on the first live call.
+    const path = `/2.3/branches/${this.cfg.branchId}/bookings`;
+    const res = await this.request<{
+      success?: boolean;
+      _id?: string;
+      Booking?: { _id?: string; status?: string };
+      booking?: { id?: string; _id?: string };
+    }>("POST", path, {
+      user_id: args.userId,
+      event_id: args.eventId,
+      model: "event",
+      model_id: args.eventId,
+      status: "WAITING",
+      charge: false,
+      pay_gym: false,
+    });
+    const id = res?.Booking?._id ?? res?._id ?? res?.booking?._id ?? res?.booking?.id;
+    if (!id) {
+      throw new GlofoxApiError(500, path, "waitlist booking created but response missing _id");
+    }
+    return { _id: id };
+  }
+
+  async cancelBooking(bookingId: string): Promise<void> {
+    // DELETE returns 204 on success or 404 if already canceled — both fine.
+    const path = `/2.3/branches/${this.cfg.branchId}/bookings/${
+      encodeURIComponent(bookingId)
+    }`;
+    try {
+      await this.request<unknown>("DELETE", path);
+    } catch (err) {
+      if (err instanceof GlofoxApiError && err.status === 404) return;
+      throw err;
+    }
+  }
+
   // --- Memberships --------------------------------------------------------
 
   async purchaseMembership(args: {
@@ -284,10 +332,91 @@ export class GlofoxClient implements GlofoxClientShape {
     return { userMembershipId };
   }
 
+  async cancelMembership(userMembershipId: string): Promise<void> {
+    // POST /v3.0/memberships/{userMembershipId}/cancel — no body required.
+    // Per api-surface.md: idempotent on already-canceled membership; verify
+    // first live call. We treat 404 as success (already canceled).
+    const path = `/v3.0/memberships/${encodeURIComponent(userMembershipId)}/cancel`;
+    try {
+      await this.request<unknown>("POST", path);
+    } catch (err) {
+      if (err instanceof GlofoxApiError && err.status === 404) return;
+      throw err;
+    }
+  }
+
+  async getMemberMemberships(userId: string): Promise<GlofoxMembershipSummary[]> {
+    // GET /2.0/branches/{branchId}/users/{userId}/memberships — used by the
+    // cancel handlers' DQ7 fallback when pushpress_enrollment_links doesn't
+    // have the userMembershipId cached.
+    //
+    // Response shape unverified end-to-end; defensive parse. We try the
+    // conventional Glofox v2.x list envelope (data: [...]) and fall back to
+    // a top-level array.
+    const path = `/2.0/branches/${this.cfg.branchId}/users/${
+      encodeURIComponent(userId)
+    }/memberships?private=any`;
+    const res = await this.request<unknown>("GET", path);
+    const items: unknown = Array.isArray(res)
+      ? res
+      : (res as { data?: unknown })?.data;
+    if (!Array.isArray(items)) return [];
+
+    return items.flatMap((raw): GlofoxMembershipSummary[] => {
+      if (!raw || typeof raw !== "object") return [];
+      const obj = raw as Record<string, unknown>;
+      const _id = typeof obj._id === "string"
+        ? obj._id
+        : typeof obj.id === "string"
+        ? obj.id
+        : null;
+      const membership_id = typeof obj.membership_id === "string"
+        ? obj.membership_id
+        : typeof obj.membershipId === "string"
+        ? obj.membershipId
+        : "";
+      const status = typeof obj.status === "string" ? obj.status : "";
+      return _id ? [{ _id, membership_id, status }] : [];
+    });
+  }
+
+  // --- Attendance & Profile -----------------------------------------------
+
+  async markAttendance(args: {
+    userId: string;
+    eventId: string;
+    attendedAt: number;
+  }): Promise<void> {
+    await this.request<unknown>("POST", "/2.0/attendances", {
+      user_id: args.userId,
+      event_id: args.eventId,
+      attended_at: args.attendedAt,
+    });
+  }
+
+  async updateMember(args: {
+    userId: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone?: string | null;
+  }): Promise<void> {
+    await this.request<unknown>(
+      "PUT",
+      `/2.0/members/${encodeURIComponent(args.userId)}`,
+      {
+        first_name: args.firstName,
+        last_name: args.lastName,
+        email: args.email.toLowerCase(),
+        phone: args.phone ?? "",
+      },
+    );
+  }
+
   // --- Private --------------------------------------------------------------
 
   private async request<T>(
-    method: "GET" | "POST" | "DELETE",
+    method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     body?: unknown,
   ): Promise<T> {
@@ -361,6 +490,10 @@ export class GlofoxReadOnlyClient implements GlofoxClientShape {
     return this.inner.getEventsByTimeRange(dateFrom, dateTo);
   }
 
+  getMemberMemberships(userId: string) {
+    return this.inner.getMemberMemberships(userId);
+  }
+
   createLead(_args: {
     email: string;
     firstName: string;
@@ -377,6 +510,17 @@ export class GlofoxReadOnlyClient implements GlofoxClientShape {
     return Promise.reject(new GlofoxWriteBlocked("createBooking"));
   }
 
+  createBookingWaitlisted(_args: {
+    userId: string;
+    eventId: string;
+  }): Promise<{ _id: string }> {
+    return Promise.reject(new GlofoxWriteBlocked("createBookingWaitlisted"));
+  }
+
+  cancelBooking(_bookingId: string): Promise<void> {
+    return Promise.reject(new GlofoxWriteBlocked("cancelBooking"));
+  }
+
   purchaseMembership(_args: {
     userId: string;
     membershipId: string;
@@ -386,6 +530,28 @@ export class GlofoxReadOnlyClient implements GlofoxClientShape {
     startDate: string;
   }): Promise<{ userMembershipId: string | null }> {
     return Promise.reject(new GlofoxWriteBlocked("purchaseMembership"));
+  }
+
+  cancelMembership(_userMembershipId: string): Promise<void> {
+    return Promise.reject(new GlofoxWriteBlocked("cancelMembership"));
+  }
+
+  markAttendance(_args: {
+    userId: string;
+    eventId: string;
+    attendedAt: number;
+  }): Promise<void> {
+    return Promise.reject(new GlofoxWriteBlocked("markAttendance"));
+  }
+
+  updateMember(_args: {
+    userId: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone?: string | null;
+  }): Promise<void> {
+    return Promise.reject(new GlofoxWriteBlocked("updateMember"));
   }
 }
 
@@ -430,6 +596,17 @@ export class GlofoxMockClient implements GlofoxClientShape {
     return Promise.resolve({ _id: "mock-glofox-booking-id" });
   }
 
+  createBookingWaitlisted(_args: {
+    userId: string;
+    eventId: string;
+  }): Promise<{ _id: string }> {
+    return Promise.resolve({ _id: "mock-glofox-waitlist-booking-id" });
+  }
+
+  cancelBooking(_bookingId: string): Promise<void> {
+    return Promise.resolve();
+  }
+
   purchaseMembership(_args: {
     userId: string;
     membershipId: string;
@@ -439,6 +616,34 @@ export class GlofoxMockClient implements GlofoxClientShape {
     startDate: string;
   }): Promise<{ userMembershipId: string | null }> {
     return Promise.resolve({ userMembershipId: "mock-glofox-user-membership-id" });
+  }
+
+  cancelMembership(_userMembershipId: string): Promise<void> {
+    return Promise.resolve();
+  }
+
+  getMemberMemberships(_userId: string): Promise<GlofoxMembershipSummary[]> {
+    return Promise.resolve([
+      { _id: "mock-glofox-user-membership-id", membership_id: "mock-mid", status: "ACTIVE" },
+    ]);
+  }
+
+  markAttendance(_args: {
+    userId: string;
+    eventId: string;
+    attendedAt: number;
+  }): Promise<void> {
+    return Promise.resolve();
+  }
+
+  updateMember(_args: {
+    userId: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone?: string | null;
+  }): Promise<void> {
+    return Promise.resolve();
   }
 }
 

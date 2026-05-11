@@ -27,7 +27,11 @@ import type {
 import { GlofoxApiError } from "../../_shared/glofox-client.ts";
 import type { PushPressClient } from "../../_shared/pushpress-client.ts";
 import { isSaunaPlanCategory } from "../../_shared/filter.ts";
-import { getOrCreateMemberLink, getPlanMapping } from "../../_shared/mappings.ts";
+import {
+  getOrCreateMemberLink,
+  getPlanMapping,
+  insertEnrollmentLink,
+} from "../../_shared/mappings.ts";
 
 export interface EnrollmentCreatedDeps {
   supabase: SupabaseClient;
@@ -124,9 +128,29 @@ export async function handleEnrollmentCreated(
       startDate,
     });
 
-    // userMembershipId may be null per DQ7 — still success. PR 3 will need
-    // it for cancel handling; if null, the cancel handler will have to look
-    // it up by other means (e.g. re-query Glofox by user + membership).
+    // userMembershipId may be null per DQ7 — still success. Cache the
+    // (enrollment, customer, userMembershipId) tuple to
+    // pushpress_enrollment_links so cancel handlers (PR 3) can find it.
+    // If userMembershipId is null, the cancel handler's Glofox fallback
+    // recovers and UPDATEs the row.
+    try {
+      await insertEnrollmentLink(deps.supabase, {
+        pushpressEnrollmentId: data.id,
+        pushpressCustomerId: data.customerId,
+        glofoxUserMembershipId: purchase.userMembershipId,
+        linkedVia: "enrollment_created",
+      });
+    } catch (err) {
+      // Link insert is best-effort — the membership IS assigned in Glofox.
+      // Worst case: cancel handler falls back to Glofox query.
+      console.error(JSON.stringify({
+        level: "warn",
+        msg: "insertEnrollmentLink failed",
+        pushpress_enrollment_id: data.id,
+        err: err instanceof Error ? err.message : String(err),
+      }));
+    }
+
     return {
       status: "success",
       glofoxResponse: { userMembershipId: purchase.userMembershipId },

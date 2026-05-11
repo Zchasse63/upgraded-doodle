@@ -66,25 +66,6 @@ export async function getOrCreateMemberLink(
   );
 }
 
-async function selectMemberLink(
-  supabase: SupabaseClient,
-  pushpressCustomerId: string,
-): Promise<MemberLink | null> {
-  const { data, error } = await supabase
-    .from("members_link")
-    .select("pushpress_customer_id, glofox_user_id, email")
-    .eq("pushpress_customer_id", pushpressCustomerId)
-    .maybeSingle();
-
-  if (error) throw new Error(`members_link select failed: ${error.message}`);
-  if (!data) return null;
-  return {
-    pushpressCustomerId: data.pushpress_customer_id,
-    glofoxUserId: data.glofox_user_id,
-    email: data.email,
-  };
-}
-
 async function insertMemberLink(
   supabase: SupabaseClient,
   pushpressCustomerId: string,
@@ -218,6 +199,161 @@ export async function getPlanMapping(
   };
 }
 
+// --- Enrollment links ------------------------------------------------------
+
+export interface EnrollmentLink {
+  pushpressEnrollmentId: string;
+  pushpressCustomerId: string;
+  glofoxUserMembershipId: string | null;
+  linkedVia: "enrollment_created" | "glofox_query" | "manual";
+}
+
+export async function getEnrollmentLink(
+  supabase: SupabaseClient,
+  pushpressEnrollmentId: string,
+): Promise<EnrollmentLink | null> {
+  const { data, error } = await supabase
+    .from("pushpress_enrollment_links")
+    .select(
+      "pushpress_enrollment_id, pushpress_customer_id, glofox_user_membership_id, linked_via",
+    )
+    .eq("pushpress_enrollment_id", pushpressEnrollmentId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`pushpress_enrollment_links select failed: ${error.message}`);
+  }
+  if (!data) return null;
+
+  return {
+    pushpressEnrollmentId: data.pushpress_enrollment_id,
+    pushpressCustomerId: data.pushpress_customer_id,
+    glofoxUserMembershipId: data.glofox_user_membership_id,
+    linkedVia: data.linked_via,
+  };
+}
+
+export async function insertEnrollmentLink(
+  supabase: SupabaseClient,
+  args: {
+    pushpressEnrollmentId: string;
+    pushpressCustomerId: string;
+    glofoxUserMembershipId: string | null;
+    linkedVia: EnrollmentLink["linkedVia"];
+  },
+): Promise<void> {
+  const { error } = await supabase.from("pushpress_enrollment_links").insert({
+    pushpress_enrollment_id: args.pushpressEnrollmentId,
+    pushpress_customer_id: args.pushpressCustomerId,
+    glofox_user_membership_id: args.glofoxUserMembershipId,
+    linked_via: args.linkedVia,
+  });
+  if (error && error.code !== "23505") {
+    throw new Error(`pushpress_enrollment_links insert failed: ${error.message}`);
+  }
+}
+
+export async function updateEnrollmentLinkUserMembershipId(
+  supabase: SupabaseClient,
+  pushpressEnrollmentId: string,
+  glofoxUserMembershipId: string,
+): Promise<void> {
+  const { error } = await supabase
+    .from("pushpress_enrollment_links")
+    .update({
+      glofox_user_membership_id: glofoxUserMembershipId,
+      linked_via: "glofox_query",
+    })
+    .eq("pushpress_enrollment_id", pushpressEnrollmentId);
+  if (error) {
+    throw new Error(`pushpress_enrollment_links update failed: ${error.message}`);
+  }
+}
+
+// Read-only member_link select — used by handlers that should NOT auto-create
+// a lead (checkin.created, customer.details.changed). Mirrors selectMemberLink
+// internally but exported for handler use.
+export async function selectMemberLink(
+  supabase: SupabaseClient,
+  pushpressCustomerId: string,
+): Promise<MemberLink | null> {
+  const { data, error } = await supabase
+    .from("members_link")
+    .select("pushpress_customer_id, glofox_user_id, email")
+    .eq("pushpress_customer_id", pushpressCustomerId)
+    .maybeSingle();
+  if (error) throw new Error(`members_link select failed: ${error.message}`);
+  if (!data) return null;
+  return {
+    pushpressCustomerId: data.pushpress_customer_id,
+    glofoxUserId: data.glofox_user_id,
+    email: data.email,
+  };
+}
+
+// Read-only slot_mappings select — used by handlers that should NOT lazily
+// resolve a new slot (checkin.created). If a checkin arrives without a prior
+// reservation.created mapping, that's an ops issue, not something to paper over.
+export async function selectSlotMapping(
+  supabase: SupabaseClient,
+  pushpressCalendarItemId: string,
+): Promise<SlotMapping | null> {
+  const { data, error } = await supabase
+    .from("slot_mappings")
+    .select("pushpress_calendar_item_id, glofox_event_id, class_type")
+    .eq("pushpress_calendar_item_id", pushpressCalendarItemId)
+    .maybeSingle();
+  if (error) throw new Error(`slot_mappings select failed: ${error.message}`);
+  if (!data) return null;
+  return {
+    pushpressCalendarItemId: data.pushpress_calendar_item_id,
+    glofoxEventId: data.glofox_event_id,
+    classType: data.class_type,
+  };
+}
+
+// DQ7 fallback: when pushpress_enrollment_links has no userMembershipId for
+// this enrollment, query Glofox for the user's memberships and find the
+// active NOEQL one. Caches the discovered ID back to enrollment_links.
+//
+// Returns null if no unique active membership matches (don't guess).
+export async function lookupMemberMembership(
+  glofox: GlofoxClientShape,
+  supabase: SupabaseClient,
+  glofoxUserId: string,
+  pushpressEnrollmentId: string,
+  expectedMembershipId: string,
+): Promise<string | null> {
+  const memberships = await glofox.getMemberMemberships(glofoxUserId);
+  // Filter to active memberships matching the expected plan-level membership_id.
+  const candidates = memberships.filter((m) =>
+    m.membership_id === expectedMembershipId &&
+    m.status.toUpperCase() !== "CANCELED"
+  );
+  if (candidates.length !== 1) {
+    console.error(JSON.stringify({
+      level: "warn",
+      msg: "lookupMemberMembership ambiguous",
+      glofox_user_id: glofoxUserId,
+      expected_membership_id: expectedMembershipId,
+      candidate_count: candidates.length,
+    }));
+    return null;
+  }
+  const id = candidates[0]._id;
+  try {
+    await updateEnrollmentLinkUserMembershipId(supabase, pushpressEnrollmentId, id);
+  } catch (err) {
+    // Cache write is best-effort — log but don't fail the lookup.
+    console.error(JSON.stringify({
+      level: "warn",
+      msg: "lookupMemberMembership cache write failed",
+      err: err instanceof Error ? err.message : String(err),
+    }));
+  }
+  return id;
+}
+
 // --- Pending refunds --------------------------------------------------------
 
 export async function enqueuePendingRefund(
@@ -231,6 +367,7 @@ export async function enqueuePendingRefund(
       | "slot_unmappable"
       | "member_unlinkable"
       | "glofox_5xx"
+      | "class_cancel_glofox_failed"
       | "other";
     glofoxError?: string;
   },

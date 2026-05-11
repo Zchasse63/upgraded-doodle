@@ -186,13 +186,20 @@ async function listSaunaClassesAhead(days: number): Promise<PPClass[]> {
   const startsBefore = startsAfter + days * 86400;
   const out: PPClass[] = [];
   let page = 1;
-  while (page < 50) {
+  let pastWindow = false;
+  while (page < 50 && !pastWindow) {
     const res = await ppGet<{ data: { resultArray: PPClass[] } }>(
       `/classes?limit=100&page=${page}&startsAfter=${startsAfter}`,
     );
     const batch = res.data.resultArray ?? [];
     for (const c of batch) {
-      if (c.start > startsBefore) continue;
+      if (c.start > startsBefore) {
+        // PushPress returns classes in ascending start order — first out-of-
+        // window item means the rest of this page and all subsequent pages
+        // are also out of window. Stop paginating instead of skipping.
+        pastWindow = true;
+        break;
+      }
       if (!c.classTypeName) continue;
       if (!SAUNA_CLASS_TYPES.includes(c.classTypeName.trim().toLowerCase())) continue;
       out.push(c);
