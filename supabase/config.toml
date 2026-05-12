@@ -65,5 +65,16 @@ verify_jwt = false
 verify_jwt = false
 schedule = "0 6 * * *"
 
+[functions.groupon-rotate-cron]
+# Groupon discount rotation. Detects which uploaded codes have been
+# redeemed (= disappeared from Glofox), marks them 'used' in the
+# groupon_codes table, and uploads the next queued codes to refill each
+# campaign to 43. Uses the Glofox dashboard internal API via a Bearer JWT
+# (GLOFOX_DASHBOARD_JWT) that expires every 24h — user must refresh via
+# scripts/update-glofox-jwt.ts. CRON_SECRET-protected like reconcile-cron.
+# Runs every 30 minutes for low-latency redemption detection.
+verify_jwt = false
+schedule = "*/30 * * * *"
+
 [analytics]
 enabled = false

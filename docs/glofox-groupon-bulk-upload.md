@@ -176,11 +176,143 @@ The JWT is 24-hour. If it expires while the script is running, you'll see consec
 
 6. **CSV updates are atomic per run.** The script writes both CSVs at the very end. If the process is killed mid-run (Ctrl-C), the CSVs reflect the LAST successful run, NOT the partial state. The audit JSON in `scripts/balance-results-*.json` is the source of truth for what happened.
 
+## Automation: `groupon-rotate-cron`
+
+A scheduled Edge Function that automates the "as codes get redeemed, upload the next from the queue" cycle. Built 2026-05-12.
+
+### Architecture
+
+```
+                    Customer redeems Groupon code on Glofox
+                                  │
+                                  ▼
+                    Glofox deletes the spent discount (or
+                    flips state — TBD via observation)
+                                  │
+                                  ▼
+   (every 30 min)  Supabase scheduler invokes groupon-rotate-cron
+                                  │
+                                  ▼
+                   1. Pull current Glofox discount list
+                   2. For each `uploaded` row in groupon_codes:
+                      if its glofox_discount_id is gone → mark 'used'
+                   3. For each campaign:
+                      if (uploaded count) < 43:
+                        pop next 'queued' codes in CSV row order
+                        POST discount + POST promo-code
+                        mark 'uploaded'
+                   4. Record run in groupon_rotation_runs
+                   5. Slack-alert on activity / errors / JWT expiry
+```
+
+### Tables (migration 0010)
+
+`groupon_codes` — master record of all 1000 codes
+- `code` (PK), `campaign` (`groupon_1` / `groupon_2`), `csv_row_index` (preserves upload order)
+- `status` (`queued` / `uploaded` / `used` / `failed`)
+- `glofox_discount_id`, `glofox_promo_code_id`, `uploaded_at`, `used_detected_at`, `failure_reason`
+
+`groupon_rotation_runs` — one row per cron invocation
+- Status counters, JWT expiry, per-campaign state snapshot
+
+### Setup (one-time)
+
+1. Apply migration 0010 (already done as of 2026-05-12 via Supabase MCP)
+2. Bootstrap the table from current state:
+   ```bash
+   export GLOFOX_DASHBOARD_JWT="eyJhbGc..."
+   deno run --allow-net --allow-read --allow-env scripts/bootstrap-groupon-codes.ts
+   ```
+   This reads both CSVs, cross-references with current Glofox state, and seeds 1000 rows.
+
+3. Set the JWT secret in Supabase:
+   ```bash
+   deno run --allow-net --allow-env --allow-run scripts/update-glofox-jwt.ts "eyJhbGc..."
+   ```
+   The helper script decodes the JWT, validates expiry, and writes to Supabase secrets via Management API (uses macOS keychain PAT).
+
+4. Deploy the Edge Function (already done):
+   ```bash
+   # via Supabase MCP deploy_edge_function
+   ```
+
+5. The schedule is in `supabase/config.toml`:
+   ```toml
+   [functions.groupon-rotate-cron]
+   verify_jwt = false
+   schedule = "*/30 * * * *"  # every 30 min
+   ```
+
+### Daily operations
+
+**Once per day** (or whenever the JWT expires), refresh:
+
+1. Open Glofox dashboard in Chrome
+2. DevTools → Network → grab Bearer token from any `app.glofox.com` request
+3. Run:
+   ```bash
+   deno run --allow-net --allow-env --allow-run scripts/update-glofox-jwt.ts "eyJhbGc..."
+   ```
+
+The script tells you when the new JWT expires. After that point, the cron will Slack-alert and stop until refreshed.
+
+**Manual cron invocation** (for testing or recovery after JWT refresh):
+```bash
+CRON_SECRET=$(grep "^CRON_SECRET=" .env.local | cut -d= -f2-)
+curl -sS -X POST -H "Authorization: Bearer $CRON_SECRET" \
+  "https://pygbvcqjpwfodmoqkhos.supabase.co/functions/v1/groupon-rotate-cron"
+```
+
+Response:
+```json
+{
+  "run_id": "<uuid>",
+  "status": "no_op" | "success" | "jwt_expired" | "error",
+  "detected_used": <int>,
+  "successful_uploads": <int>,
+  "per_campaign_state": { "groupon_1": {...}, "groupon_2": {...} }
+}
+```
+
+### Detection logic
+
+The cron detects "used" codes by checking if their `glofox_discount_id` is still in the discounts list. If a discount has been deleted (presumably because its single-use code was redeemed), the corresponding row gets marked `used`.
+
+**Caveat**: this assumes Glofox auto-deletes discounts when their single-use codes are redeemed. We haven't directly observed this — we've only verified that manually-deleted discounts are caught correctly. If Glofox instead keeps used discounts around with some "spent" flag, detection won't work and we'll need a different signal. See the [open question in `docs/open-questions.md`](open-questions.md) — Q14 (post-redemption-behavior).
+
+If detection is unreliable, fallback is manual: query Glofox usage stats periodically, mark codes used by hand via SQL.
+
+### Slack alerts
+
+- 🚨 `GLOFOX_DASHBOARD_JWT not set` or `expired` — refresh required
+- ⚠️ JWT expires in <10 min — refresh soon
+- ✓ Activity summary when codes were detected used or uploaded
+- 🚨 Errors during a rotation run
+
+Silent on `no_op` runs (cron ran, nothing changed) to avoid noise.
+
+### Adjusting target counts
+
+Edit `GROUPON_TARGET_PER_CAMPAIGN` env var (default 43). If Glofox raises the 100-cap, bump this up.
+
+```bash
+# Via Supabase Management API (same pattern as scripts/update-glofox-jwt.ts):
+TOKEN=$(security find-generic-password -s "Servous Supabase PAT" -w)
+curl -X POST "https://api.supabase.com/v1/projects/pygbvcqjpwfodmoqkhos/secrets" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '[{"name":"GROUPON_TARGET_PER_CAMPAIGN","value":"80"}]'
+```
+
+Next cron run will refill up to the new target.
+
+---
+
 ## Future improvements (deferred)
 
-- If Glofox raises the cap → raise `TARGET_PER_GROUPON` and re-run; the script handles incremental adds cleanly
+- If Glofox raises the cap → bump `GROUPON_TARGET_PER_CAMPAIGN`, cron handles incremental adds cleanly
 - If Glofox publishes a real API endpoint for discount creation → migrate to that and abandon the internal-API workaround
-- A "rotate" mode: take 10 codes that have been redeemed (expired) and replace with 10 new ones from the queue. Currently manual.
+- If Glofox exposes promo-code redemption webhooks → swap the polling cron for event-driven; latency drops from 30 min to seconds
+- Auto-refresh the JWT (e.g., headless-browser script that logs in nightly via stored credentials) — fragile and against TOS, deferred until a service-account becomes available
 
 ## See also
 
