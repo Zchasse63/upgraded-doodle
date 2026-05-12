@@ -4,14 +4,18 @@
 // attendances`). Only kind=class && role=attendee && result=success triggers
 // the mirror; everything else is filtered.
 //
-// Read-only mapping lookups: a check-in without a prior reservation.created
-// implies either we missed the booking or the member bypassed booking — auto-
-// creating a member-link or slot-mapping at check-in time would mask a real
-// data-integrity problem. Fail visibly instead.
+// Spec-verified shape (2026-05-12 from Glofox OpenAPI):
+//   AttendanceRequest = { model: "bookings", model_ids: [bookingId, ...] }
 //
-// Quirk: the checkin payload uses `customer` / `company` (not `customerId`
-// / `companyId`). The dispatcher's pickCompanyId helper already accounts for
-// this; here we read `data.customer` directly.
+// That means attendance is keyed by **Glofox booking_id**, NOT event_id or
+// user_id. We need to:
+//   1. Find the prior successful `reservation.created` row for this customer
+//      and class — that row stores the booking_id in glofox_response
+//   2. Mark attendance on that booking_id
+//
+// Quirk: the checkin payload uses `data.customer` / `data.company` (NOT
+// `customerId` / `companyId` like other events). We read `data.customer`
+// directly. See docs/pushpress/webhook-events.md.
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import type {
@@ -20,7 +24,6 @@ import type {
   PushPressWebhookBody,
 } from "../../_shared/types.ts";
 import { GlofoxApiError } from "../../_shared/glofox-client.ts";
-import { selectMemberLink, selectSlotMapping } from "../../_shared/mappings.ts";
 import { alertOps } from "../../_shared/slack.ts";
 
 export interface CheckinCreatedDeps {
@@ -53,37 +56,51 @@ export async function handleCheckinCreated(
     };
   }
 
-  if (!data.customer || !data.classId || typeof data.timestamp !== "number") {
+  if (!data.customer || !data.classId) {
     return {
       status: "failed",
-      error: "checkin payload missing customer, classId, or timestamp",
+      error: "checkin payload missing customer or classId",
     };
   }
 
-  const memberLink = await selectMemberLink(deps.supabase, data.customer);
-  if (!memberLink) {
-    return { status: "failed", error: "member_not_linked" };
-  }
+  // Find the matching prior `reservation.created` success row. We filter on
+  // both reservedId (= classId from checkin) AND customerId so multi-user
+  // events don't ambiguously match.
+  const { data: priorRow, error } = await deps.supabase
+    .from("event_log")
+    .select("glofox_response, payload")
+    .eq("pushpress_event", "reservation.created")
+    .eq("handler_status", "success")
+    .filter("payload->data->>reservedId", "eq", data.classId)
+    .filter("payload->data->>customerId", "eq", data.customer)
+    .order("received_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-  const slotMapping = await selectSlotMapping(deps.supabase, data.classId);
-  if (!slotMapping) {
-    return { status: "failed", error: "slot_not_mapped" };
+  if (error) {
+    return { status: "failed", error: `event_log query failed: ${error.message}` };
+  }
+  if (!priorRow) {
+    return {
+      status: "failed",
+      error: "no_prior_booking_for_this_customer_and_class",
+    };
+  }
+  const bookingId = (priorRow.glofox_response as { bookingId?: string } | null)
+    ?.bookingId;
+  if (!bookingId) {
+    return { status: "failed", error: "prior_booking_missing_bookingId" };
   }
 
   try {
-    await deps.glofox.markAttendance({
-      userId: memberLink.glofoxUserId,
-      eventId: slotMapping.glofoxEventId,
-      attendedAt: data.timestamp,
-    });
-    return { status: "success" };
+    await deps.glofox.markAttendance(bookingId);
+    return { status: "success", glofoxResponse: { bookingId } };
   } catch (err) {
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
         void alertOps(deps.supabase, "checkin.created", {
           reason: "glofox_5xx",
-          user_id: memberLink.glofoxUserId,
-          event_id: slotMapping.glofoxEventId,
+          booking_id: bookingId,
           status: err.status,
           error: err.message,
         });
@@ -91,7 +108,7 @@ export async function handleCheckinCreated(
       return {
         status: "failed",
         error: err.message,
-        glofoxResponse: { error: err.message, status: err.status },
+        glofoxResponse: { bookingId, error: err.message, status: err.status },
       };
     }
     return {

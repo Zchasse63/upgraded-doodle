@@ -8,15 +8,13 @@ One-way webhook middleware that mirrors PushPress events into Glofox. Built for 
 
 **Live deployment**, single PushPress tenant: TSG's sandbox (`client_ddd1caa8be7225`). Awaiting cutover to CC's real PushPress.
 
-- **9 of 9 webhook handlers shipped** (reservation.created, reservation.canceled, reservation.waitlisted*, class.canceled, enrollment.created, enrollment.status.changed, enrollment.deleted, checkin.created, customer.details.changed)
-- **2 Edge Functions deployed**:
-  - `pushpress-webhook` (v16) — the main entry point
-  - `reconcile-cron` (v3) — scheduled safety-net audit, daily 6 AM UTC
-- **8 migrations applied** (initial schema + filtered_status + pin_search_path + plan_mappings_promo + plan_mappings_seed + enrollment_links + pending_refunds_class_cancel + event_log_retention)
+- **9 of 9 webhook handlers shipped** (reservation.created, reservation.canceled, reservation.waitlisted, class.canceled, enrollment.created, enrollment.status.changed, enrollment.deleted, checkin.created, customer.details.changed)
+- **2 Edge Functions deployed**: `pushpress-webhook` + `reconcile-cron` (daily 6 AM UTC)
+- **9 migrations applied** (initial schema, filtered_status, pin_search_path, plan_mappings_promo, plan_mappings_seed, enrollment_links, pending_refunds_class_cancel, event_log_retention, event_log_payload_gin)
 - **74 unit tests** passing
 - `GLOFOX_MODE=live` (real Glofox writes), `CRON_SECRET` set, `SLACK_OPS_WEBHOOK_URL` empty (alerts silent)
 
-`reservation.waitlisted` is gated behind `GLOFOX_WAITLIST_VERIFIED=true` because Glofox silently ignores the `status: "WAITING"` flag — needs Glofox API support contact to resolve (OQ-1).
+OpenAPI spec mined 2026-05-12 closed two prior open questions: Q12 (attendance uses `model: "bookings"` + booking_ids) and OQ-1 (waitlist field is `join_waiting_list`, not `status`).
 
 Audit + plan: [`docs/audit-2026-05-11.md`](docs/audit-2026-05-11.md). PR architectures: [`docs/pr-1-architecture.md`](docs/pr-1-architecture.md), [`docs/pr-2-architecture.md`](docs/pr-2-architecture.md), [`docs/pr-3-architecture.md`](docs/pr-3-architecture.md). Live open questions: [`docs/open-questions.md`](docs/open-questions.md).
 
@@ -143,7 +141,6 @@ Live creds in `.env.local` (gitignored). See `.env.example` for the full list. T
 | `PUSHPRESS_WEBHOOK_SIGNING_SECRET` | Returned at subscription creation |
 | `GLOFOX_API_KEY`, `GLOFOX_API_TOKEN`, `GLOFOX_BRANCH_ID` | Glofox 3-header auth |
 | `GLOFOX_MODE` | `mock` / `readonly` / `live` |
-| `GLOFOX_WAITLIST_VERIFIED` | `"true"` to enable waitlist handler — only after OQ-1 resolved |
 | `SAUNA_CLASS_TYPE_ALLOWLIST` | Comma-separated PushPress `classTypeName`s to mirror (currently `"Sauna"`) |
 | `SAUNA_PLAN_CATEGORY_ALLOWLIST` | Comma-separated plan `category.name`s for enrollments (currently `"Sauna"`) |
 | `CRON_SECRET` | Required for reconcile-cron auth (set in Supabase secrets, not just .env.local) |

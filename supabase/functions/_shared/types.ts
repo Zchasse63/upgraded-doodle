@@ -75,8 +75,11 @@ export interface GlofoxClientShape {
     dateFrom: number,
     dateTo: number,
   ): Promise<Array<{ _id: string; time_start: number; name?: string }>>;
-  createBooking(args: { userId: string; eventId: string }): Promise<{ _id: string }>;
-  createBookingWaitlisted(args: { userId: string; eventId: string }): Promise<{ _id: string }>;
+  createBooking(args: {
+    userId: string;
+    eventId: string;
+    joinWaitingList?: boolean;
+  }): Promise<{ _id: string; status: string }>;
   cancelBooking(bookingId: string): Promise<void>;
   purchaseMembership(args: {
     userId: string;
@@ -88,11 +91,9 @@ export interface GlofoxClientShape {
   }): Promise<{ userMembershipId: string | null }>;
   cancelMembership(userMembershipId: string): Promise<void>;
   getMemberMemberships(userId: string): Promise<GlofoxMembershipSummary[]>;
-  markAttendance(args: {
-    userId: string;
-    eventId: string;
-    attendedAt: number;
-  }): Promise<void>;
+  // Spec-verified: POST /2.0/attendances expects {model:"bookings", model_ids:[bookingId,...]}.
+  // No user_id, no attended_at. Glofox uses the bookings to derive both.
+  markAttendance(bookingId: string): Promise<void>;
   updateMember(args: {
     userId: string;
     firstName: string;

@@ -184,64 +184,42 @@ export class GlofoxClient implements GlofoxClientShape {
   async createBooking(args: {
     userId: string;
     eventId: string;
-  }): Promise<{ _id: string }> {
+    joinWaitingList?: boolean;
+  }): Promise<{ _id: string; status: string }> {
     // Glofox requires `model` + `model_id` on POST bookings or returns
     // 400 MODEL_IS_REQUIRED, MODEL_ID_IS_REQUIRED. The accepted INPUT value
-    // is `"event"` (singular, lowercase); Glofox then stores it as `"events"`
-    // (plural) on the booking record — input/output asymmetry verified via
-    // direct probe 2026-05-11. Sending the plural form (`"events"`) on input
-    // is rejected with `INVALID_MODEL`. `model_id` is the event's `_id`.
+    // is `"event"` (singular, lowercase); Glofox stores it as `"events"`
+    // (plural) on the booking record. Verified 2026-05-11.
+    //
+    // Waitlist: pass `join_waiting_list: true` ONLY when the class is full
+    // (per Glofox spec). Glofox returns Booking.status = "WAITING" in that
+    // case (vs. "BOOKED" for confirmed). The flag must NOT be set otherwise
+    // — sending it when the class still has spots produces unexpected
+    // server behavior per the OpenAPI doc.
     const path = `/2.3/branches/${this.cfg.branchId}/bookings`;
-    const res = await this.request<{
-      success?: boolean;
-      _id?: string;
-      Booking?: { _id?: string };
-      booking?: { id?: string; _id?: string };
-    }>("POST", path, {
+    const body: Record<string, unknown> = {
       user_id: args.userId,
       event_id: args.eventId,
       model: "event",
       model_id: args.eventId,
       charge: false, // CC bills in PushPress; Glofox must NOT charge
-      pay_gym: false, // do NOT deduct from member's Glofox credits
-    });
-    // Verified shape (2026-05-11): { success: true, Booking: { _id, ... } }.
-    // Keep legacy fallbacks for resilience but prefer `Booking._id` first.
-    const id = res?.Booking?._id ?? res?._id ?? res?.booking?._id ?? res?.booking?.id;
-    if (!id) {
-      throw new GlofoxApiError(500, path, "booking created but response missing _id");
-    }
-    return { _id: id };
-  }
+    };
+    if (args.joinWaitingList) body.join_waiting_list = true;
 
-  async createBookingWaitlisted(args: {
-    userId: string;
-    eventId: string;
-  }): Promise<{ _id: string }> {
-    // Same as createBooking but adds status:"WAITING" to land on the waitlist
-    // rather than as a confirmed booking. Glofox waitlist field is documented
-    // in api-surface.md but unverified end-to-end — log the response shape so
-    // we can confirm on the first live call.
-    const path = `/2.3/branches/${this.cfg.branchId}/bookings`;
     const res = await this.request<{
       success?: boolean;
       _id?: string;
       Booking?: { _id?: string; status?: string };
       booking?: { id?: string; _id?: string };
-    }>("POST", path, {
-      user_id: args.userId,
-      event_id: args.eventId,
-      model: "event",
-      model_id: args.eventId,
-      status: "WAITING",
-      charge: false,
-      pay_gym: false,
-    });
+    }>("POST", path, body);
     const id = res?.Booking?._id ?? res?._id ?? res?.booking?._id ?? res?.booking?.id;
     if (!id) {
-      throw new GlofoxApiError(500, path, "waitlist booking created but response missing _id");
+      throw new GlofoxApiError(500, path, "booking created but response missing _id");
     }
-    return { _id: id };
+    return {
+      _id: id,
+      status: res?.Booking?.status ?? "BOOKED",
+    };
   }
 
   async cancelBooking(bookingId: string): Promise<void> {
@@ -396,28 +374,19 @@ export class GlofoxClient implements GlofoxClientShape {
 
   // --- Attendance & Profile -----------------------------------------------
 
-  async markAttendance(args: {
-    userId: string;
-    eventId: string;
-    attendedAt: number;
-  }): Promise<void> {
-    // Attendance uses a DIFFERENT input shape than bookings:
-    //   - model_ids (plural, ARRAY) not model_id (sing)
-    //   - model: "events" (plural) not "event" (sing)
-    // Verified 2026-05-11 via direct probe. Singular variants return
-    // "Invalid model or model_ids" or "The model is not implemented".
-    //
-    // SEMANTIC NOTE (also verified 2026-05-11): the attendance endpoint
-    // appears to resolve the booking server-side from (event, model_ids) and
-    // may attribute attendance to the wrong user when multiple bookings exist
-    // for the event. This needs end-to-end verification in TSG's dashboard
-    // before any checkin.created handler invocation can be trusted in
-    // production. Open question — see docs/open-questions.md (Q12, new).
+  async markAttendance(bookingId: string): Promise<void> {
+    // POST /2.0/attendances expects the BOOKING id (not event_id) under
+    // `model_ids`. The OpenAPI spec (verified 2026-05-12) defines:
+    //   AttendanceRequest = { model: "bookings", model_ids: [bookingId, ...] }
+    // No user_id, no event_id, no timestamp — Glofox derives all of those
+    // from the booking record. Our earlier probe sent event_ids with
+    // model:"events" and got back an unrelated user's booking in the
+    // response (that was Glofox returning whatever booking matched the
+    // event), which is what spawned the Q12 attribution mystery. Fixed
+    // here by passing the right field shape.
     await this.request<unknown>("POST", "/2.0/attendances", {
-      user_id: args.userId,
-      model: "events",
-      model_ids: [args.eventId],
-      attended_at: args.attendedAt,
+      model: "bookings",
+      model_ids: [bookingId],
     });
   }
 
@@ -548,15 +517,9 @@ export class GlofoxReadOnlyClient implements GlofoxClientShape {
   createBooking(_args: {
     userId: string;
     eventId: string;
-  }): Promise<{ _id: string }> {
+    joinWaitingList?: boolean;
+  }): Promise<{ _id: string; status: string }> {
     return Promise.reject(new GlofoxWriteBlocked("createBooking"));
-  }
-
-  createBookingWaitlisted(_args: {
-    userId: string;
-    eventId: string;
-  }): Promise<{ _id: string }> {
-    return Promise.reject(new GlofoxWriteBlocked("createBookingWaitlisted"));
   }
 
   cancelBooking(_bookingId: string): Promise<void> {
@@ -578,11 +541,7 @@ export class GlofoxReadOnlyClient implements GlofoxClientShape {
     return Promise.reject(new GlofoxWriteBlocked("cancelMembership"));
   }
 
-  markAttendance(_args: {
-    userId: string;
-    eventId: string;
-    attendedAt: number;
-  }): Promise<void> {
+  markAttendance(_bookingId: string): Promise<void> {
     return Promise.reject(new GlofoxWriteBlocked("markAttendance"));
   }
 
@@ -631,18 +590,15 @@ export class GlofoxMockClient implements GlofoxClientShape {
     ]);
   }
 
-  createBooking(_args: {
+  createBooking(args: {
     userId: string;
     eventId: string;
-  }): Promise<{ _id: string }> {
-    return Promise.resolve({ _id: "mock-glofox-booking-id" });
-  }
-
-  createBookingWaitlisted(_args: {
-    userId: string;
-    eventId: string;
-  }): Promise<{ _id: string }> {
-    return Promise.resolve({ _id: "mock-glofox-waitlist-booking-id" });
+    joinWaitingList?: boolean;
+  }): Promise<{ _id: string; status: string }> {
+    return Promise.resolve({
+      _id: args.joinWaitingList ? "mock-glofox-waitlist-booking-id" : "mock-glofox-booking-id",
+      status: args.joinWaitingList ? "WAITING" : "BOOKED",
+    });
   }
 
   cancelBooking(_bookingId: string): Promise<void> {
@@ -670,11 +626,7 @@ export class GlofoxMockClient implements GlofoxClientShape {
     ]);
   }
 
-  markAttendance(_args: {
-    userId: string;
-    eventId: string;
-    attendedAt: number;
-  }): Promise<void> {
+  markAttendance(_bookingId: string): Promise<void> {
     return Promise.resolve();
   }
 

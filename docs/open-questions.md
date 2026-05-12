@@ -249,23 +249,17 @@ Once the bridge is stable, it will be re-pointed at CC's real PushPress. At that
 
 ---
 
-## Q12 — Glofox attendance endpoint attribution
+## Q12 — Glofox attendance endpoint attribution — **ANSWERED 2026-05-12**
 
-**Status**: OPEN — verify before checkin.created goes live
+The OpenAPI spec resolves this. `AttendanceRequest` is:
+```yaml
+model: "bookings"   # NOT "events"
+model_ids: [bookingId, ...]   # an array of BOOKING IDs, not event IDs
+```
 
-**Question**: When `POST /2.0/attendances` is called with `user_id`, `model: "events"`, `model_ids: [event_id]`, does Glofox mark attendance for THAT user, or does it find a matching booking on the event and mark attendance for whichever user owns that booking?
+No `user_id`, no `attended_at`. Glofox derives both from the booking record. Our earlier probe used event IDs and got back an unrelated user's booking because Glofox was treating it as a query by event, not a write by user.
 
-**Context**: Direct probe 2026-05-11 found that the attendance endpoint uses a different request shape than bookings (plural `model_ids` array + `model: "events"` plural). After fixing the shape, the response showed a booking for a DIFFERENT user (Artem K) than the user_id we passed (Zach). It's unclear whether:
-1. The response shows the booking that WAS marked attended (= we attributed to the wrong person), or
-2. The response is incidentally listing existing bookings for the event while the actual attendance write went against the user_id we passed
-
-**How to resolve**:
-1. Pick a Glofox event with TWO known test users booked.
-2. Call `POST /2.0/attendances` with one specific user_id.
-3. Check Glofox dashboard / reports: which user got marked attended?
-4. If the wrong user: the endpoint must accept the booking_id directly (look for an alternative field name like `booking_id` or a booking-scoped endpoint), and checkin-created must look up the booking_id from event_log first.
-
-**Owner**: next implementation session, before checkin.created goes live.
+**Resolution**: `markAttendance` now takes a booking_id directly. The `checkin.created` handler looks up the prior `reservation.created` event_log row (filtered by `reservedId` AND `customerId`), reads its `glofox_response.bookingId`, and passes that. Verified end-to-end via tests.
 
 ---
 
@@ -298,21 +292,13 @@ The booking metadata has been seen to carry `metadata.service.id` matching a use
 
 ---
 
-## OQ-1 (PR 3) — Glofox waitlist field doesn't trigger waitlist behavior
+## OQ-1 — Glofox waitlist field — **ANSWERED 2026-05-12**
 
-**Status**: OPEN — handler gated off
+The OpenAPI spec gives us the field: `join_waiting_list: true` on `POST /2.3/branches/{branchId}/bookings`. Our earlier probe used `status: "WAITING"`, which was the wrong field name (silently ignored by Glofox).
 
-**Question**: How do we create a waitlist booking via Glofox's REST API? The `status: "WAITING"` field is accepted on `POST /2.3/branches/{branchId}/bookings` but doesn't trigger waitlist semantics — the response confirms `status: "BOOKED"` (confirmed, not waitlisted).
+Per the spec: "Send this parameter to `true` only when the class is full. Send `false` or not send it when the class still has available spots."
 
-**Context**: Direct probe 2026-05-11 with `{user_id, event_id, model, model_id, status: "WAITING", charge: false, pay_gym: false}` returned `success: true` but `Booking.status: "BOOKED"`. The waitlist flag was silently ignored.
-
-**Current state**: `reservation-waitlisted` handler is deployed but gated behind `GLOFOX_WAITLIST_VERIFIED=true` env var. Without that flag set, it returns `status:'skipped', error:'waitlist_field_unverified...'`. This prevents incorrect bookings while we figure out the right approach.
-
-**How to resolve**:
-1. Email Glofox API support for the correct waitlist endpoint / field name.
-2. Or: investigate a separate endpoint like `POST /2.3/branches/{branchId}/waitlist` or `POST /2.3/.../bookings/waitlist`.
-
-**Owner**: TSG ops to email Glofox; once verified, set `GLOFOX_WAITLIST_VERIFIED=true` in Supabase secrets.
+**Resolution**: `createBooking` now accepts an optional `joinWaitingList: boolean`. The `reservation.waitlisted` handler passes `true`. The `GLOFOX_WAITLIST_VERIFIED` env-var gate has been removed. Response carries `Booking.status: "WAITING"` (vs `"BOOKED"`) — we record both `bookingId` and `status` in `glofox_response`.
 
 ---
 

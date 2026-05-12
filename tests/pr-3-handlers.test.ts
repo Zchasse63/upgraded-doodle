@@ -85,17 +85,20 @@ function mockSupabase(tables: MockTables) {
           return builder;
         },
         filter(col: string, op: string, value: unknown) {
-          // Support `payload->data->>id` and `payload->data->>reservedId`.
           if (op !== "eq") throw new Error(`mock: unsupported filter op ${op}`);
           filters.push((row) => {
             const payload = row.payload as { data?: Record<string, unknown> } | undefined;
             if (col === "payload->data->>id") return payload?.data?.id === value;
             if (col === "payload->data->>reservedId") return payload?.data?.reservedId === value;
+            if (col === "payload->data->>customerId") return payload?.data?.customerId === value;
             throw new Error(`mock: unsupported filter column ${col}`);
           });
           return builder;
         },
         gte(_col: string, _value: unknown) {
+          return builder;
+        },
+        order(_col: string, _opts?: { ascending?: boolean }) {
           return builder;
         },
         limit(_n: number) {
@@ -219,7 +222,6 @@ function makeGlofox(overrides: Partial<GlofoxClientShape> = {}): CapturingGlofox
     createLead: wrap("createLead"),
     getEventsByTimeRange: wrap("getEventsByTimeRange"),
     createBooking: wrap("createBooking"),
-    createBookingWaitlisted: wrap("createBookingWaitlisted"),
     cancelBooking: wrap("cancelBooking"),
     purchaseMembership: wrap("purchaseMembership"),
     cancelMembership: wrap("cancelMembership"),
@@ -503,10 +505,15 @@ Deno.test("enrollment-deleted: link found but userMembershipId null → skipped"
 // checkin-created
 // =============================================================================
 
-Deno.test("checkin-created: kind=class, attendee, success → markAttendance", async () => {
+Deno.test("checkin-created: looks up prior booking_id → markAttendance with booking_id", async () => {
   const tables = newTables();
-  tables.members_link["usr_c"] = { glofox_user_id: "gf_user_c", email: "c@x" };
-  tables.slot_mappings["cls_c"] = { glofox_event_id: "gf_evt_c", class_type: "Sauna" };
+  // Seed the prior reservation.created row that the handler looks up
+  tables.event_log.push({
+    pushpress_event: "reservation.created",
+    handler_status: "success",
+    payload: { data: { id: "reg_c", reservedId: "cls_c", customerId: "usr_c" } },
+    glofox_response: { bookingId: "book_c" },
+  });
   const glofox = makeGlofox();
   // deno-lint-ignore no-explicit-any
   const result = await handleCheckinCreated(
@@ -527,9 +534,11 @@ Deno.test("checkin-created: kind=class, attendee, success → markAttendance", a
   );
   assertEquals(result.status, "success");
   assertEquals(glofox.calls.markAttendance?.length, 1);
+  // Verified shape: markAttendance receives the booking_id, not event_id.
+  assertEquals(glofox.calls.markAttendance?.[0], ["book_c"]);
 });
 
-Deno.test("checkin-created: kind=appointment → filtered", async () => {
+Deno.test("checkin-created: kind=appointment → filtered, no event_log lookup", async () => {
   const tables = newTables();
   const glofox = makeGlofox();
   // deno-lint-ignore no-explicit-any
@@ -553,9 +562,8 @@ Deno.test("checkin-created: kind=appointment → filtered", async () => {
   assertEquals(glofox.calls.markAttendance, undefined);
 });
 
-Deno.test("checkin-created: member not linked → failed (no auto-create)", async () => {
+Deno.test("checkin-created: no prior booking found → failed", async () => {
   const tables = newTables();
-  tables.slot_mappings["cls_z"] = { glofox_event_id: "gf_z", class_type: "Sauna" };
   const glofox = makeGlofox();
   // deno-lint-ignore no-explicit-any
   const result = await handleCheckinCreated(
@@ -575,7 +583,7 @@ Deno.test("checkin-created: member not linked → failed (no auto-create)", asyn
     { supabase: mockSupabase(tables) as any, glofox },
   );
   assertEquals(result.status, "failed");
-  assertEquals(result.error, "member_not_linked");
+  assertEquals(result.error, "no_prior_booking_for_this_customer_and_class");
 });
 
 // =============================================================================
@@ -645,39 +653,7 @@ Deno.test("customer-details-changed: missing email → failed", async () => {
 // reservation-waitlisted
 // =============================================================================
 
-Deno.test("reservation-waitlisted: gated off by default (GLOFOX_WAITLIST_VERIFIED unset) → skipped", async () => {
-  Deno.env.delete("GLOFOX_WAITLIST_VERIFIED");
-  _resetForTests();
-  Deno.env.set("SAUNA_CLASS_TYPE_ALLOWLIST", "Sauna");
-  const tables = newTables();
-  const glofox = makeGlofox();
-  const fakePushpress = {
-    getClass: async () => ({ id: "cal_w", classTypeName: "Sauna", start: 1700000000, end: 1700003600 }),
-    getCustomer: async () => ({
-      id: "u",
-      email: "u@x",
-      name: { first: "U", last: "X" },
-      phone: null,
-    }),
-    getPlan: async () => ({ id: "p", name: "P", companyId: "c", category: { name: "Sauna" } }),
-    // deno-lint-ignore no-explicit-any
-  } as any;
-
-  const result = await handleReservationWaitlisted(
-    {
-      event: "reservation.waitlisted",
-      created: 1,
-      data: { id: "reg_w", reservedId: "cal_w", customerId: "usr_w" },
-    },
-    { supabase: mockSupabase(tables) as never, glofox, pushpress: fakePushpress },
-  );
-  assertEquals(result.status, "skipped");
-  assert(result.error?.startsWith("waitlist_field_unverified"));
-  assertEquals(glofox.calls.createBookingWaitlisted, undefined);
-});
-
-Deno.test("reservation-waitlisted: enabled + sauna + linked member + slot mapped → createBookingWaitlisted", async () => {
-  Deno.env.set("GLOFOX_WAITLIST_VERIFIED", "true");
+Deno.test("reservation-waitlisted: sauna + linked member + slot mapped → createBooking with joinWaitingList=true", async () => {
   _resetForTests();
   Deno.env.set("SAUNA_CLASS_TYPE_ALLOWLIST", "Sauna");
   const tables = newTables();
@@ -704,7 +680,31 @@ Deno.test("reservation-waitlisted: enabled + sauna + linked member + slot mapped
     { supabase: mockSupabase(tables) as never, glofox, pushpress: fakePushpress },
   );
   assertEquals(result.status, "success");
-  assertEquals(glofox.calls.createBookingWaitlisted?.length, 1);
-  Deno.env.delete("GLOFOX_WAITLIST_VERIFIED");
+  assertEquals(glofox.calls.createBooking?.length, 1);
+  const firstCall = glofox.calls.createBooking?.[0] as unknown[] | undefined;
+  const args = firstCall?.[0] as { joinWaitingList?: boolean } | undefined;
+  assertEquals(args?.joinWaitingList, true);
+  _resetForTests();
+});
+
+Deno.test("reservation-waitlisted: non-sauna class type → filtered, no Glofox call", async () => {
+  _resetForTests();
+  Deno.env.set("SAUNA_CLASS_TYPE_ALLOWLIST", "Sauna");
+  const tables = newTables();
+  const glofox = makeGlofox();
+  const fakePushpress = {
+    getClass: async () => ({ id: "cal_cf", classTypeName: "CrossFit", start: 1700000000, end: 1700003600 }),
+    // deno-lint-ignore no-explicit-any
+  } as any;
+  const result = await handleReservationWaitlisted(
+    {
+      event: "reservation.waitlisted",
+      created: 1,
+      data: { id: "reg_cf", reservedId: "cal_cf", customerId: "usr_cf" },
+    },
+    { supabase: mockSupabase(tables) as never, glofox, pushpress: fakePushpress },
+  );
+  assertEquals(result.status, "filtered");
+  assertEquals(glofox.calls.createBooking, undefined);
   _resetForTests();
 });

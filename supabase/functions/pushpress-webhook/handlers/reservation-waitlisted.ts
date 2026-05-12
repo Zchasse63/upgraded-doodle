@@ -1,14 +1,15 @@
 // Handler for the PushPress `reservation.waitlisted` webhook.
 //
 // Same resolution chain as reservation.created (member → slot → Glofox) but
-// calls createBookingWaitlisted instead of createBooking. The Glofox call
-// adds `status: "WAITING"` to the bookings POST body.
+// passes `joinWaitingList: true` to createBooking so Glofox treats the call
+// as a waitlist add. The Glofox spec (verified 2026-05-12) says to pass
+// `join_waiting_list: true` ONLY when the class is full — when the bridge
+// hears `reservation.waitlisted` from PushPress, that's exactly the case
+// (the class was full at PushPress-time, so it should be at Glofox-time too).
 //
-// OQ-1: Glofox waitlist semantics are unverified end-to-end. If the
-// GLOFOX_WAITLIST_VERIFIED env var is not set to "true", we deploy the
-// handler but skip the actual Glofox call — this gates the feature behind
-// an explicit opt-in once TSG ops confirms the waitlist flow against the
-// live API. event_log captures the would-have-been booking attempt for ops.
+// Response: `Booking.status` will be `"WAITING"` instead of `"BOOKED"`;
+// we return that in glofoxResponse so the cancel handler (later) can find
+// and DELETE the same booking record whether it's a waitlist or confirmed.
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import type {
@@ -49,14 +50,6 @@ export async function handleReservationWaitlisted(
     return {
       status: "failed",
       error: "waitlist payload missing required fields (id, reservedId, customerId)",
-    };
-  }
-
-  // Gate behind GLOFOX_WAITLIST_VERIFIED until OQ-1 is resolved.
-  if (Deno.env.get("GLOFOX_WAITLIST_VERIFIED") !== "true") {
-    return {
-      status: "skipped",
-      error: "waitlist_field_unverified_set_GLOFOX_WAITLIST_VERIFIED_to_enable",
     };
   }
 
@@ -116,19 +109,18 @@ export async function handleReservationWaitlisted(
   }
 
   try {
-    const booking = await deps.glofox.createBookingWaitlisted({
+    const booking = await deps.glofox.createBooking({
       userId: memberLink.glofoxUserId,
       eventId: slotMapping.glofoxEventId,
+      joinWaitingList: true,
     });
     return {
       status: "success",
-      glofoxResponse: { bookingId: booking._id, waitlist: true },
+      glofoxResponse: { bookingId: booking._id, status: booking.status, waitlist: true },
     };
   } catch (err) {
     if (err instanceof GlofoxCapacityError) {
-      // Waitlist hitting capacity error is unusual — the whole point of
-      // waitlist is to bypass capacity. Treat same as the created path
-      // but flag it as unusual in the alert.
+      // WAITING_LIST_IS_FULL falls through to here. Surface it for ops.
       await enqueuePendingRefund(deps.supabase, {
         reservationId: data.id,
         customerId: data.customerId,
@@ -137,7 +129,7 @@ export async function handleReservationWaitlisted(
         glofoxError: err.message,
       });
       void alertOps(deps.supabase, "reservation.waitlisted", {
-        reason: "waitlist_capacity_error_unexpected",
+        reason: "waitlist_full_or_capacity",
         booking_target: slotMapping.glofoxEventId,
         error: err.message,
       });

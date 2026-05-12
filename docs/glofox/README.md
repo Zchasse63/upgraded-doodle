@@ -96,18 +96,18 @@ Some endpoints return `has_more`; others require length-based detection (if you 
 
 For single-location studios (TSG is one location), the branch UUID and the location UUID are the same value. Endpoints inconsistently use both terms — same value either way.
 
-### 6. Bookings vs attendances use DIFFERENT model shapes (input/output asymmetry)
+### 6. Bookings vs attendances use DIFFERENT model shapes
 
-Both endpoints require `model` + `model_id`-style fields, but the names and shapes differ:
+Both endpoints require `model`-style fields, but the names and reference IDs are different:
 
-| Endpoint | Field name | Value |
-|---|---|---|
-| `POST /2.3/.../bookings` | `model` | `"event"` (singular, lowercase) |
-| `POST /2.3/.../bookings` | `model_id` | the event's `_id` (string) |
-| `POST /2.0/attendances` | `model` | `"events"` (PLURAL, lowercase) |
-| `POST /2.0/attendances` | `model_ids` | `[<event_id>]` (PLURAL, ARRAY) |
+| Endpoint | `model` | `model_id` / `model_ids` | Reference type |
+|---|---|---|---|
+| `POST /2.3/.../bookings` | `"event"` (singular) | `model_id: <event_id>` (singular) | event_id |
+| `POST /2.0/attendances` | `"bookings"` (plural) | `model_ids: [<booking_id>]` (plural array) | **booking_id** (not event_id!) |
 
-Sending the wrong shape returns `200 success:false "Invalid model or model_ids"`. The plural/singular inversion is undocumented — verified via direct probe 2026-05-11. **The bookings response actually stores it as `model: "events"` (plural)** even though input requires singular — Glofox normalizes on the input.
+Verified via OpenAPI spec 2026-05-12. The attendance endpoint takes booking IDs because Glofox uses them to derive both the user_id and event_id from the booking record. Sending event IDs to attendances returns a booking for someone else's booking on that event (that bit us during probing — Q12).
+
+Bookings has an input/output asymmetry: input must be `model: "event"` (singular), but Glofox stores it as `model: "events"` (plural) on the booking record. Sending `"events"` on input is rejected with `INVALID_MODEL`.
 
 ### 7. `cancelBooking` returns 400 (not 404) for missing bookings
 
@@ -147,9 +147,9 @@ We tried every plausible path. None return a user's assigned memberships:
 
 **Combined with quirk #8, this means we cannot programmatically cancel a membership unless we capture the `userMembershipId` at purchase time — which Glofox doesn't expose.** Cancel handlers degrade gracefully (skip with Slack alert); manual cancel in the dashboard is required. See [`docs/open-questions.md`](../open-questions.md) Q13.
 
-### 10. `status: "WAITING"` flag on bookings POST is silently ignored
+### 10. Waitlist field is `join_waiting_list` (boolean), not `status: "WAITING"`
 
-`POST /2.3/.../bookings` accepts `status: "WAITING"` in the body without error but creates a CONFIRMED booking (response `Booking.status: "BOOKED"`). The proper waitlist endpoint is unknown. Our `reservation-waitlisted` handler is gated behind `GLOFOX_WAITLIST_VERIFIED=true` env var to prevent incorrect confirmed bookings. See [`docs/open-questions.md`](../open-questions.md) OQ-1.
+`POST /2.3/.../bookings` waitlist control is `join_waiting_list: true`. The field we tried first (`status: "WAITING"`) is silently ignored — that was a misread, not a Glofox bug. Set `join_waiting_list: true` only when the class is full; response will then have `Booking.status: "WAITING"` instead of `"BOOKED"`. Documented in OpenAPI schemas `BookingEventAsAMember` / `BookingEventAsAStaff` (verified 2026-05-12).
 
 ### 11. `/2.0/register` requires a digit in the password
 

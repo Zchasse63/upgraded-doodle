@@ -122,9 +122,12 @@ export async function handleReservationCreated(
       userId: memberLink.glofoxUserId,
       eventId: slotMapping.glofoxEventId,
     });
+    // booking.status will be "BOOKED" for normal reservations. If Glofox
+    // ever returns "WAITING" here (it shouldn't without join_waiting_list),
+    // we still record success — the bookingId is what matters for cancel.
     return {
       status: "success",
-      glofoxResponse: { bookingId: booking._id },
+      glofoxResponse: { bookingId: booking._id, status: booking.status },
     };
   } catch (err) {
     if (err instanceof GlofoxCapacityError) {

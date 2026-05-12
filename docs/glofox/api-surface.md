@@ -183,17 +183,19 @@ Content-Type: application/json
   "model": "event",
   "model_id": "<same as event_id>",
   "charge": false,
-  "pay_gym": false
+  "join_waiting_list": true    // OPTIONAL — set true when the class is full
 }
 ```
 
-**Use case**: PushPress fires `reservation.created` → mirror as a Glofox booking.
+**Use case**: PushPress fires `reservation.created` (or `reservation.waitlisted`) → mirror as a Glofox booking.
 
-**Critical fields**:
-- `model: "event"` (singular) + `model_id` — **REQUIRED.** Without them: `400 MODEL_IS_REQUIRED, MODEL_ID_IS_REQUIRED`. The plural form (`"events"`) is rejected with `INVALID_MODEL`. Input/output asymmetry: stored canonical value is `"events"` but input must be `"event"`. Verified 2026-05-11.
-- `charge: false` — do not attempt to charge the user (no Stripe / card flow)
-- `pay_gym: false` — do not deduct from the user's credit/class pack at Glofox; PushPress handles billing
-- `status: "WAITING"` — **silently ignored**; Glofox creates a confirmed booking regardless. The real waitlist endpoint is unknown (see [OQ-1](../open-questions.md)).
+**Critical fields** (verified against OpenAPI spec 2026-05-12 — schema `BookingEventAsAMember` / `BookingEventAsAStaff`):
+- `model: "event"` (singular) + `model_id` — **REQUIRED.** Without them: `400 MODEL_IS_REQUIRED, MODEL_ID_IS_REQUIRED`. The plural form (`"events"`) is rejected with `INVALID_MODEL`. Input/output asymmetry: stored canonical value is `"events"` but input must be `"event"`.
+- `charge: false` — do not attempt to charge the user (no Stripe / card flow).
+- `join_waiting_list: true` — set this **only** when the class is full and the customer should land on the waitlist instead of being rejected. Send `false` or omit otherwise. When set, response `Booking.status` is `"WAITING"` (vs `"BOOKED"`). Previously we tried `status: "WAITING"` which the API silently ignored — that was a misread; the right field is `join_waiting_list`.
+
+**Not in the schema** (we previously sent these but they're undocumented):
+- `pay_gym: false` — was in the older `BookingRequest` schema as a payment_method enum value, not a separate field. Harmless to send but useless.
 
 **Response (success)**:
 ```json
@@ -267,23 +269,20 @@ POST /2.0/attendances
 Content-Type: application/json
 
 {
-  "user_id": "...",
-  "model": "events",
-  "model_ids": ["<event_id>"],
-  "attended_at": 1715443800
+  "model": "bookings",
+  "model_ids": ["<booking_id>"]
 }
 ```
 
 **Use case**: PushPress fires `checkin.created` with `kind: "class"` and `result: "success"`.
 
-**Field shape (verified 2026-05-11 — DIFFERENT from bookings)**:
-- `model: "events"` (**PLURAL**, lowercase) — NOT `"event"` like bookings
-- `model_ids: [<event_id>]` (**PLURAL, ARRAY**) — NOT `model_id` singular like bookings
-- `attended_at` is Unix seconds
+**Field shape (verified via OpenAPI spec `AttendanceRequest` 2026-05-12)**:
+- `model: "bookings"` (literal, no other values accepted)
+- `model_ids: [<booking_id>, ...]` — array of **BOOKING IDs** (not event IDs and not user IDs)
 
-Sending the singular forms returns `200 success:false "Invalid model or model_ids"`.
+That's the whole body — no `user_id`, no `event_id`, no timestamp. Glofox derives everything from the booking record. Our earlier probe sent event IDs with `model: "events"` (plural) and got back a different user's booking in the response — that's because Glofox was matching the event against any booking, not because it was attributing attendance correctly. The Q12 attribution mystery is resolved: pass the right booking_id, get the right attribution.
 
-**⚠️ Attendance attribution unverified.** Probe 2026-05-11 returned a response containing a booking for a DIFFERENT user than the one we passed. It's unclear whether Glofox marks attendance for the user_id passed, OR matches a booking on the event and attributes to whoever owns that booking. See [Q12](../open-questions.md). Verify in TSG's Glofox dashboard before trusting `checkin.created` in production.
+**Handler integration**: `checkin-created` looks up the prior `reservation.created` event_log row (filtered by `reservedId` AND `customerId` so multi-user events disambiguate), extracts `glofox_response.bookingId`, passes that to `markAttendance`.
 
 **Notes**:
 - Only `kind: "class"` events trigger this handler. Appointment / event / open-gym checkins are skipped.
