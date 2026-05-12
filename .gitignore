@@ -4,6 +4,14 @@
 .env.*.local
 *.env
 
+# Sensitive: Groupon discount codes (real customer-redeemable strings)
+scripts/groupon-codes.csv
+scripts/groupon-codes.txt
+scripts/groupon-1-codes.csv
+scripts/groupon-2-codes.csv
+scripts/groupon-upload-results.json
+scripts/balance-results-*.json
+
 # Supabase
 supabase/.branches
 supabase/.temp
