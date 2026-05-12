@@ -202,7 +202,7 @@ function seedDefaultPlanMapping(state: MockState): void {
     pushpress_plan_name: "Sauna 8 Pack (Recurring)",
     glofox_membership_id: "69fe0e2c238a9b2cd206fa15",
     glofox_plan_code: "1778259589341",
-    payment_method: "complimentary",
+    payment_method: "cash",
     glofox_promo_code: "TESTCODE",
     is_active: true,
   };
@@ -256,7 +256,7 @@ Deno.test(
     );
     assertEquals(purchaseCalled, true);
     assertEquals(purchaseArgs.promoCode, "TESTCODE");
-    assertEquals(purchaseArgs.paymentMethod, "complimentary");
+    assertEquals(purchaseArgs.paymentMethod, "cash");
   }),
 );
 

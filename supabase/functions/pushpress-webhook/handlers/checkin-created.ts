@@ -80,7 +80,7 @@ export async function handleCheckinCreated(
   } catch (err) {
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
-        await alertOps(deps.supabase, "checkin.created", {
+        void alertOps(deps.supabase, "checkin.created", {
           reason: "glofox_5xx",
           user_id: memberLink.glofoxUserId,
           event_id: slotMapping.glofoxEventId,

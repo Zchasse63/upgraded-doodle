@@ -136,7 +136,7 @@ export async function handleReservationWaitlisted(
         reason: "capacity_full",
         glofoxError: err.message,
       });
-      await alertOps(deps.supabase, "reservation.waitlisted", {
+      void alertOps(deps.supabase, "reservation.waitlisted", {
         reason: "waitlist_capacity_error_unexpected",
         booking_target: slotMapping.glofoxEventId,
         error: err.message,
@@ -149,7 +149,7 @@ export async function handleReservationWaitlisted(
     }
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
-        await alertOps(deps.supabase, "reservation.waitlisted", {
+        void alertOps(deps.supabase, "reservation.waitlisted", {
           reason: "glofox_5xx",
           status: err.status,
           error: err.message,

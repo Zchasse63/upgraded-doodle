@@ -17,6 +17,12 @@
 
 const DEFAULT_BASE_URL = "https://api.pushpress.com/v3";
 const MAX_ERROR_BODY_CHARS = 2048;
+// Wall-clock per-request timeout. Edge Functions cap at ~30s total; an
+// unresponsive PushPress would otherwise stall the handler and leave the
+// event_log row stuck at 'pending'. Lower than the Glofox timeout because
+// our PushPress reads (getCustomer, getClass, getPlan) are typically much
+// faster than Glofox writes.
+const REQUEST_TIMEOUT_MS = 10_000;
 
 function clipErrorBody(s: string): string {
   return s.length > MAX_ERROR_BODY_CHARS
@@ -138,16 +144,32 @@ export class PushPressClient {
   }
 
   private async request<T>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method: "GET",
-      headers: {
-        "API-KEY": this.cfg.apiKey,
-        "company-id": this.cfg.companyId,
-        "Content-Type": "application/json",
-      },
-    });
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    let res: Response;
+    let text: string;
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, {
+        method: "GET",
+        headers: {
+          "API-KEY": this.cfg.apiKey,
+          "company-id": this.cfg.companyId,
+          "Content-Type": "application/json",
+        },
+        signal: ctrl.signal,
+      });
+      text = await res.text();
+    } catch (err) {
+      const msg = err instanceof Error && err.name === "AbortError"
+        ? `request timeout after ${REQUEST_TIMEOUT_MS}ms`
+        : err instanceof Error
+        ? err.message
+        : String(err);
+      throw new PushPressApiError(0, path, msg);
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
-    const text = await res.text();
     if (!res.ok) {
       throw new PushPressApiError(res.status, path, clipErrorBody(text));
     }

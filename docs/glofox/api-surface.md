@@ -29,27 +29,43 @@ Content-Type: application/json
 
 **Response**: member record with `user.id` if found. Empty / error if not. **Verify response shape in sandbox** — Meridian's sync engine queries members in bulk via a different shape; this lookup-by-email path may not be exercised in production.
 
-### Create a lead
+### Create a user (was: create a lead)
 
 ```
-POST /2.1/branches/{branchId}/leads
+POST /2.0/register
 Content-Type: application/json
 
 {
-  "email": "...",
+  "email": "...",        // will be normalized to lowercase by the bridge
   "first_name": "...",
   "last_name": "...",
-  "phone": "...",
-  "status": "new"
+  "phone": "",
+  "password": "<random-with-a-digit>!"
 }
 ```
 
-**Use case**: PushPress customer can't be matched to an existing Glofox member — auto-create a Glofox lead with the PushPress contact info.
+**Use case**: PushPress customer can't be matched to an existing Glofox member — auto-create a Glofox user with the PushPress contact info.
 
-**Notes**:
-- GloFox treats every signup as a "lead" — there's no separate "member" creation API. Real "member" status is derived from purchase activity.
-- Per Meridian's CLAUDE.md: "Never filter the leads sync by status — most legitimate people have null status from GloFox; the sync engine defaults null to 'new'."
-- The created lead's `user.id` is used in subsequent membership-purchase / booking calls.
+**Why not `/2.1/branches/{branchId}/leads`?** That endpoint is deprecated — verified 2026-05-11. Every request returns `INVALID_USER_TYPE` regardless of body. `/2.0/register` works and creates a `type: "member"` user (better for tracking anyway — we're not doing CRM-style lead qualification).
+
+**Password requirements**: must contain at least one **digit** (`PASSWORD_RULE_DIGIT` error otherwise). The bridge generates `Bridge-<16 hex chars>!` which can rarely (~1 in 2M) be digit-free. The user never logs in directly (their login lives in PushPress / CC's app); for direct Glofox access they'd reset via forgot-password.
+
+**Response (success)**:
+```json
+{
+  "success": true,
+  "user": {
+    "_id": "<glofox_user_id>",
+    "first_name": "...",
+    "last_name": "...",
+    "email": "...",
+    "membership": { "type": "payg" },
+    ...
+  }
+}
+```
+
+The `user._id` is the Glofox user UUID used in subsequent membership-purchase / booking calls.
 
 ### Update member contact info
 
@@ -81,9 +97,9 @@ POST /2.2/branches/{branchId}/users/{userId}/memberships/{membershipId}/plans/{p
 Content-Type: application/json
 
 {
-  "payment_method": "<see open-questions.md Q1>",
-  "promo_code": null,
-  "start_date": "2026-05-11"
+  "payment_method": "cash",
+  "start_date": "1778543804",
+  "promo_code": "TESTCODE"
 }
 ```
 
@@ -92,12 +108,31 @@ Content-Type: application/json
 **Path parameters**:
 - `branchId` — the TSG branch UUID from `x-glofox-branch-id` (yes, it appears in the path AND the header)
 - `userId` — Glofox user UUID from the lead/member lookup
-- `membershipId` — from `plan_mappings`
+- `membershipId` — from `plan_mappings` (NOEQL = `69fe0e2c238a9b2cd206fa15`)
 - `planCode` — from `plan_mappings` (Glofox memberships have variant codes for different billing schedules)
 
-**Critical**: the `payment_method` value determines whether Glofox tries to charge. Canonical Glofox payment-method IDs (from the `/Analytics/report` schema): `cash`, `credit_card`, `bank_transfer`, `paypal`, `direct_debit`, `complimentary`, `wallet`. **Strongest candidate for externally-billed: `complimentary`** (Glofox's native "no-charge" type). Backup: any `staff_only: true` method configured for TSG's branch — enumerate via the [Payment methods](#payment-methods) endpoint below.
+**Body fields (verified 2026-05-11)**:
+- `payment_method: "cash"` — Q1 resolution. `complimentary` is not API-accessible even when enabled on the plan; `direct_debit` requires a customer-side mandate that doesn't exist for bridged users. `cash` is staff_only=true and API-accessible. Combined with the `TESTCODE` 100%-off promo, produces a $0-net assignment with no charge flow.
+- `start_date` — must be a **Unix timestamp STRING** (e.g. `"1778543804"`). Glofox's PHP backend prepends `@` and feeds the value to `DateTime::__construct`, which only accepts Unix-style strings. Sending `"2026-05-11"` produces "Double timezone specification" error. Use [`parseStartDateToUnix`](../../supabase/functions/_shared/glofox-client.ts) helper.
+- `promo_code` — omit when null/undefined (don't send the field at all). Sending `null` may be treated as "apply empty promo".
 
-This is [**open question Q1**](../open-questions.md), the gating blocker for PR 1.
+**Response (success)**:
+```json
+{
+  "success": true,
+  "message": "CART_LEGACY_PURCHASE_SUCCESS",
+  "message_code": "CART_LEGACY_PURCHASE_SUCCESS",
+  "status": "SUCCESS",
+  "invoice_id": "<uuid>"
+}
+```
+
+**⚠️ Glofox does NOT return the `userMembershipId` at purchase time.** Only an `invoice_id` (which is a different identifier, not usable for cancel). The membership IS assigned (visible in dashboard) but we can't capture the ID needed for later cancel. Combined with the lack of a "list user's memberships" endpoint (see [open question Q13](../open-questions.md)), cancel handlers can't auto-resolve `userMembershipId` and fall back to a manual-ops path. The bridge persists `(enrollment_id, customer_id, null)` to `pushpress_enrollment_links` for forensic correlation.
+
+**Failure modes**:
+- Member already has an active membership with no end-date: `200 success:false CART_LEGACY_PURCHASE_ERROR`
+- Invalid payment_method: `200 success:false` with descriptive error
+- Invalid promo_code: `200 success:false`
 
 ### Cancel a membership
 
@@ -107,7 +142,13 @@ POST /v3.0/memberships/{userMembershipId}/cancel
 
 **Use case**: PushPress fires `enrollment.status.changed → canceled` or `enrollment.deleted`.
 
-**Path parameter**: `userMembershipId` is returned by the assign call (not the same as the plan's `membershipId`). Store it on the `enrollment.created` event handler's success path so the cancel handler can find it.
+**Path parameter**: `userMembershipId` would be the per-assignment identifier (NOT the plan-level `membershipId`). However, **Glofox does not expose this ID** — `purchaseMembership` doesn't echo it (see above), and no REST endpoint lists a user's memberships. The bridge cannot reliably auto-cancel; manual cancel in the Glofox dashboard is required. See [Q13](../open-questions.md).
+
+**Responses (verified 2026-05-11)**:
+- **200** on successful cancel
+- **404** with body `{"status":"NOT_FOUND","error_code":"MEMBER_NOT_FOUND","message":"Member not found"}` for unknown IDs
+
+The bridge's `cancelMembership` treats 404 as idempotent success.
 
 ---
 
@@ -139,6 +180,8 @@ Content-Type: application/json
 {
   "user_id": "...",
   "event_id": "...",
+  "model": "event",
+  "model_id": "<same as event_id>",
   "charge": false,
   "pay_gym": false
 }
@@ -147,14 +190,33 @@ Content-Type: application/json
 **Use case**: PushPress fires `reservation.created` → mirror as a Glofox booking.
 
 **Critical fields**:
+- `model: "event"` (singular) + `model_id` — **REQUIRED.** Without them: `400 MODEL_IS_REQUIRED, MODEL_ID_IS_REQUIRED`. The plural form (`"events"`) is rejected with `INVALID_MODEL`. Input/output asymmetry: stored canonical value is `"events"` but input must be `"event"`. Verified 2026-05-11.
 - `charge: false` — do not attempt to charge the user (no Stripe / card flow)
 - `pay_gym: false` — do not deduct from the user's credit/class pack at Glofox; PushPress handles billing
-- For `reservation.waitlisted`: include `status: "WAITING"` (or whatever the Glofox waitlist flag is — **verify in sandbox**, this is [open question Q4](../open-questions.md))
+- `status: "WAITING"` — **silently ignored**; Glofox creates a confirmed booking regardless. The real waitlist endpoint is unknown (see [OQ-1](../open-questions.md)).
 
-**Response**: includes the Glofox `booking.id`. Save in the `event_log.glofox_response` for the cancel handler.
+**Response (success)**:
+```json
+{
+  "success": true,
+  "Booking": {
+    "_id": "<booking_id>",
+    "user_id": "...",
+    "event_id": "...",
+    "model": "events",
+    "model_id": "<event_id>",
+    "model_name": "Open Sauna",
+    "status": "BOOKED",
+    "type": "events",
+    ...
+  }
+}
+```
+
+Save `Booking._id` in `event_log.glofox_response.bookingId` for the cancel handler.
 
 **Failure modes**:
-- Capacity full: `4xx` with parseable error → enqueue `pending_refunds`
+- Capacity full: `4xx` (exact shape unverified — still [open question Q4](../open-questions.md))
 - User has no eligible membership: same path
 - Event doesn't exist (stale `slot_mappings` row): re-resolve via `GET /2.0/events`
 
@@ -166,9 +228,14 @@ DELETE /2.3/branches/{branchId}/bookings/{bookingId}
 
 **Use case**: PushPress fires `reservation.canceled` or `class.canceled` (fan-out to every linked booking).
 
+**Verified responses (2026-05-11)**:
+- **204 No Content** on successful cancel
+- **400** with body `{"success":false,"message":"Booking Not Found","message_code":"BOOKING_NOT_FOUND",...}` for an already-canceled or non-existent booking (NOT 404)
+
+Treat both `204` and `400 + BOOKING_NOT_FOUND` as idempotent success. The bridge's `cancelBooking` wrapper does this.
+
 **Notes**:
-- Idempotent — calling DELETE on an already-deleted booking returns success (verify in sandbox; if not, swallow the 404).
-- For `class.canceled` we fan out and may issue many concurrent DELETEs. Stay under the rate limit (10 RPS live), but a single class fan-out is unlikely to hit it.
+- For `class.canceled` we fan out **sequentially** — `GlofoxClient.pace()` enforces 200ms between calls; parallel fan-out would exceed Glofox's 10 RPS limit. 6 bookings ≈ 1.2s total, acceptable for a rare event.
 
 ---
 
@@ -201,16 +268,42 @@ Content-Type: application/json
 
 {
   "user_id": "...",
-  "event_id": "...",
+  "model": "events",
+  "model_ids": ["<event_id>"],
   "attended_at": 1715443800
 }
 ```
 
 **Use case**: PushPress fires `checkin.created` with `kind: "class"` and `result: "success"`.
 
+**Field shape (verified 2026-05-11 — DIFFERENT from bookings)**:
+- `model: "events"` (**PLURAL**, lowercase) — NOT `"event"` like bookings
+- `model_ids: [<event_id>]` (**PLURAL, ARRAY**) — NOT `model_id` singular like bookings
+- `attended_at` is Unix seconds
+
+Sending the singular forms returns `200 success:false "Invalid model or model_ids"`.
+
+**⚠️ Attendance attribution unverified.** Probe 2026-05-11 returned a response containing a booking for a DIFFERENT user than the one we passed. It's unclear whether Glofox marks attendance for the user_id passed, OR matches a booking on the event and attributes to whoever owns that booking. See [Q12](../open-questions.md). Verify in TSG's Glofox dashboard before trusting `checkin.created` in production.
+
 **Notes**:
-- `attended_at` is Unix seconds.
 - Only `kind: "class"` events trigger this handler. Appointment / event / open-gym checkins are skipped.
+
+---
+
+---
+
+## Endpoints we LOOKED for but couldn't find
+
+These don't exist (or aren't accessible to our auth). Documented so we don't re-search.
+
+| Goal | Tried (all 404 / Route not found / WRONG_URL) |
+|---|---|
+| List a user's assigned memberships | `/2.0/branches/{b}/users/{u}/memberships`, `/2.0/users/{u}/memberships`, `/2.0/users/{u}/user-memberships`, `/2.0/private-memberships?user_id=...`, `/2.0/memberships?user_id=...` (param ignored), `/v3.0/users/{u}/memberships` |
+| Waitlist a user explicitly | `status: "WAITING"` on `POST /bookings` (silently ignored — creates confirmed booking) |
+| Get a single membership by user_membership_id | `/v3.0/memberships/{id}` (only `/cancel` works) |
+| Get user's transactions | `/2.0/transactions?user_id=...`, `/2.0/branches/{b}/users/{u}/transactions` |
+
+For both **list-user-memberships** and **waitlist endpoint**, the resolution path is to email `glofox.APISupport@abcfitness.com`. See [Q12, Q13, OQ-1](../open-questions.md).
 
 ---
 
@@ -218,15 +311,19 @@ Content-Type: application/json
 
 | Method | Path | Used by handler |
 |---|---|---|
-| `POST` | `/v3.0/namespaces/members/retrieve` | `enrollment.created`, `reservation.created` (lookup) |
-| `POST` | `/2.1/branches/{branchId}/leads` | `enrollment.created`, `reservation.created` (fallback create) |
+| `POST` | `/v3.0/namespaces/members/retrieve` | `enrollment.created`, `reservation.created`, `reservation.waitlisted` (lookup) |
+| `POST` | `/2.0/register` | auto-create lead fallback (uses `/2.0/register` not deprecated `/2.1/.../leads` — verified 2026-05-11) |
 | `PUT` | `/2.0/members/{userId}` | `customer.details.changed` |
 | `POST` | `/2.2/branches/{branchId}/users/{userId}/memberships/{membershipId}/plans/{planCode}/purchase` | `enrollment.created` |
-| `POST` | `/v3.0/memberships/{userMembershipId}/cancel` | `enrollment.status.changed`, `enrollment.deleted` |
-| `GET` | `/2.0/events?date_from=...&date_to=...` | `reservation.created` (lazy lookup) |
-| `POST` | `/2.3/branches/{branchId}/bookings` | `reservation.created`, `reservation.waitlisted` |
+| `POST` | `/v3.0/memberships/{userMembershipId}/cancel` | `enrollment.status.changed`, `enrollment.deleted` (manual-only — Glofox doesn't expose `userMembershipId`) |
+| `GET` | `/2.0/events?start=...&end=...` | `reservation.created`, `reservation.waitlisted` (lazy slot mapping) |
+| `POST` | `/2.3/branches/{branchId}/bookings` | `reservation.created`, `reservation.waitlisted` (waitlist flag ignored — gated handler) |
 | `DELETE` | `/2.3/branches/{branchId}/bookings/{bookingId}` | `reservation.canceled`, `class.canceled` |
-| `POST` | `/2.0/attendances` | `checkin.created` |
+| `POST` | `/2.0/attendances` | `checkin.created` (attribution unverified — see Q12) |
+| `GET` | `/2.0/memberships?private=any` | one-shot tooling: plan enumeration for seeding |
+| `GET` | `/2.0/programs` | one-shot tooling: program/category enumeration |
 | `GET` | `/2.1/branches/{branchId}/payment-methods` | one-shot Q1 probe (not a runtime handler) |
+| `GET` | `/2.0/members/{userId}?private=any` | one-shot diagnostic: returns user's PRIMARY membership only (not NOEQL) |
+| `GET` | `/2.0/bookings?user_id=...&limit=N` | diagnostic only |
 
-9 events, 9 endpoint patterns. Roughly 1:1 (some events share endpoints — bookings is reused for create/waitlist/cancel). The payment-methods endpoint is a tooling-only call used once during Q1 resolution, not a runtime handler dependency.
+9 events → 9 endpoint patterns plus a handful of read-only diagnostic / tooling endpoints. Bookings POST is reused for create + (would-be) waitlist; bookings DELETE is reused for reservation.canceled + class.canceled fan-out.

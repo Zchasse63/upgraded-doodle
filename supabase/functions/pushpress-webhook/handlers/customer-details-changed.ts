@@ -72,7 +72,7 @@ export async function handleCustomerDetailsChanged(
   } catch (err) {
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
-        await alertOps(deps.supabase, "customer.details.changed", {
+        void alertOps(deps.supabase, "customer.details.changed", {
           reason: "glofox_5xx",
           user_id: memberLink.glofoxUserId,
           status: err.status,

@@ -124,7 +124,7 @@ export async function handleClassCanceled(
       // Alert on 5xx; capacity / 4xx are also worth alerting since this
       // is the cancel path and any failure here = stuck data.
       if (err instanceof GlofoxApiError) {
-        await alertOps(deps.supabase, "class.canceled", {
+        void alertOps(deps.supabase, "class.canceled", {
           reason: "booking_delete_failed",
           booking_id: t.bookingId,
           reservation_id: t.reservationId,

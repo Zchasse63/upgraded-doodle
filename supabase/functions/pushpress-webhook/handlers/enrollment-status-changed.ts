@@ -103,7 +103,7 @@ export async function handleEnrollmentStatusChanged(
   } catch (err) {
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
-        await alertOps(deps.supabase, "enrollment.status.changed", {
+        void alertOps(deps.supabase, "enrollment.status.changed", {
           reason: "glofox_5xx_on_cancel",
           user_membership_id: userMembershipId,
           status: err.status,

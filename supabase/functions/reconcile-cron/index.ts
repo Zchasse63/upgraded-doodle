@@ -71,15 +71,29 @@ interface PPPlan {
   category?: { name?: string };
 }
 
+const PP_REQUEST_TIMEOUT_MS = 10_000;
+
 async function ppGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${PP_BASE_URL}${path}`, {
-    headers: { "API-KEY": PP_KEY, "company-id": PP_CO, "Accept": "application/json" },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`PushPress ${res.status} ${path}: ${text.slice(0, 200)}`);
+  const ctrl = new AbortController();
+  const timeoutId = setTimeout(() => ctrl.abort(), PP_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${PP_BASE_URL}${path}`, {
+      headers: { "API-KEY": PP_KEY, "company-id": PP_CO, "Accept": "application/json" },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`PushPress ${res.status} ${path}: ${text.slice(0, 200)}`);
+    }
+    return JSON.parse(await res.text()) as T;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`PushPress timeout after ${PP_REQUEST_TIMEOUT_MS}ms on ${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return JSON.parse(await res.text()) as T;
 }
 
 async function listSaunaClassesAhead(days: number): Promise<PPClass[]> {
@@ -133,6 +147,18 @@ async function countReservationGaps(): Promise<number> {
     const reservations = await listReservationsForClass(cls.id);
     const active = reservations.filter((r) => r.status === "reserved");
     for (const res of active) {
+      // Type guard: a non-string id from a hypothetical PushPress API change
+      // would silently make the .filter() match nothing and inflate the gap
+      // count. Skip with a structured log instead so we notice.
+      if (typeof res.id !== "string") {
+        console.error(JSON.stringify({
+          level: "warn",
+          msg: "reservation_id_not_string_skipping",
+          class_id: cls.id,
+          actual_type: typeof res.id,
+        }));
+        continue;
+      }
       const { data } = await supabase
         .from("event_log")
         .select("dedup_key")
@@ -182,6 +208,15 @@ async function countEnrollmentGaps(): Promise<number> {
 
   let gaps = 0;
   for (const e of out) {
+    if (typeof e.id !== "string") {
+      console.error(JSON.stringify({
+        level: "warn",
+        msg: "enrollment_id_not_string_skipping",
+        plan_id: e.planId,
+        actual_type: typeof e.id,
+      }));
+      continue;
+    }
     const { data } = await supabase
       .from("event_log")
       .select("dedup_key")
@@ -218,6 +253,33 @@ async function postSlack(reservationGaps: number, enrollmentGaps: number): Promi
   }
 }
 
+// Constant-time string compare via HMAC-SHA256 commitment. Both inputs are
+// hashed with a fresh per-request key, then the resulting fixed-length digests
+// are compared byte-for-byte. This neutralizes length-based timing oracles
+// even if CRON_SECRET length changes between deployments.
+const COMPARE_ENC = new TextEncoder();
+async function safeBearerEquals(provided: string, expected: string): Promise<boolean> {
+  const keyBytes = new Uint8Array(32);
+  crypto.getRandomValues(keyBytes);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const [a, b] = await Promise.all([
+    crypto.subtle.sign("HMAC", key, COMPARE_ENC.encode(provided)),
+    crypto.subtle.sign("HMAC", key, COMPARE_ENC.encode(expected)),
+  ]);
+  const av = new Uint8Array(a);
+  const bv = new Uint8Array(b);
+  if (av.length !== bv.length) return false;
+  let diff = 0;
+  for (let i = 0; i < av.length; i++) diff |= av[i] ^ bv[i];
+  return diff === 0;
+}
+
 Deno.serve(async (req) => {
   // Auth is always required. An empty CRON_SECRET is a misconfiguration,
   // not "dev mode" — without auth this function exposes reconcile output
@@ -233,18 +295,7 @@ Deno.serve(async (req) => {
     );
   }
   const auth = req.headers.get("authorization") ?? "";
-  // Constant-time-ish compare via length + char loop. Bearer prefix is fixed,
-  // so length-leak is the secret length only — which is fixed at deploy time
-  // and not a sensitive signal.
-  const expected = `Bearer ${CRON_SECRET}`;
-  if (auth.length !== expected.length) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) {
-    diff |= auth.charCodeAt(i) ^ expected.charCodeAt(i);
-  }
-  if (diff !== 0) {
+  if (!(await safeBearerEquals(auth, `Bearer ${CRON_SECRET}`))) {
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -277,17 +328,21 @@ Deno.serve(async (req) => {
     reservation_gaps: reservationGaps,
     enrollment_gaps: enrollmentGaps,
     duration_ms: Date.now() - startedAt,
-    errors,
+    errors,  // full details only in structured logs
   }));
 
   await postSlack(reservationGaps, enrollmentGaps);
 
+  // Response body intentionally excludes raw error strings. Detailed errors
+  // (with upstream URLs, response bodies, etc.) are written to the Edge
+  // Function log only — anyone holding the CRON_SECRET should not get a
+  // diagnostics window into upstream API state via this endpoint.
   return new Response(
     JSON.stringify({
       reservationGaps,
       enrollmentGaps,
       durationMs: Date.now() - startedAt,
-      errors,
+      hadErrors: errors.length > 0,
     }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );

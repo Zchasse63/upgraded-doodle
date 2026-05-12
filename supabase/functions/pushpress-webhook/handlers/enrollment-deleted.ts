@@ -61,7 +61,7 @@ export async function handleEnrollmentDeleted(
   } catch (err) {
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
-        await alertOps(deps.supabase, "enrollment.deleted", {
+        void alertOps(deps.supabase, "enrollment.deleted", {
           reason: "glofox_5xx_on_cancel",
           user_membership_id: link.glofoxUserMembershipId,
           status: err.status,

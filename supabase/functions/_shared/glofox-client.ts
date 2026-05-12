@@ -22,6 +22,12 @@ import type {
 const DEFAULT_BASE_URL = "https://gf-api.aws.glofox.com/prod";
 const INTER_CALL_DELAY_MS = 200;
 const MAX_ERROR_BODY_CHARS = 2048;
+// Wall-clock timeout per Glofox request. Supabase Edge Functions cap a single
+// invocation at ~30s; without an explicit AbortSignal a hung Glofox connection
+// would stall until the runtime killed the isolate, leaving event_log rows
+// stuck at 'pending'. 15s gives plenty of headroom against Glofox's typical
+// ~200ms latency while staying well under the platform limit.
+const REQUEST_TIMEOUT_MS = 15_000;
 
 function clipErrorBody(s: string): string {
   return s.length > MAX_ERROR_BODY_CHARS
@@ -449,14 +455,29 @@ export class GlofoxClient implements GlofoxClientShape {
       "x-glofox-api-token": this.cfg.apiToken,
       "x-glofox-branch-id": this.cfg.branchId,
     };
-    const init: RequestInit = { method, headers };
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    const init: RequestInit = { method, headers, signal: ctrl.signal };
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(body);
     }
 
-    const res = await fetch(url, init);
-    const text = await res.text();
+    let res: Response;
+    let text: string;
+    try {
+      res = await fetch(url, init);
+      text = await res.text();
+    } catch (err) {
+      const msg = err instanceof Error && err.name === "AbortError"
+        ? `request timeout after ${REQUEST_TIMEOUT_MS}ms`
+        : err instanceof Error
+        ? err.message
+        : String(err);
+      throw new GlofoxApiError(0, path, msg);
+    } finally {
+      clearTimeout(timeoutId);
+    }
     let json: unknown = null;
     try {
       json = text ? JSON.parse(text) : null;

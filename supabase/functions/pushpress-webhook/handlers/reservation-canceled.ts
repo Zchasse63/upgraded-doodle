@@ -65,7 +65,9 @@ export async function handleReservationCanceled(
   } catch (err) {
     if (err instanceof GlofoxApiError) {
       if (err.status >= 500) {
-        await alertOps(deps.supabase, "reservation.canceled", {
+        // Fire-and-forget — never block the handler on Slack throttle queries
+        // or Slack POST latency. alertOps already swallows its own errors.
+        void alertOps(deps.supabase, "reservation.canceled", {
           reason: "glofox_5xx",
           booking_id: bookingId,
           error: err.message,
