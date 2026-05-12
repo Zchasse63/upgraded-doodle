@@ -249,6 +249,83 @@ Once the bridge is stable, it will be re-pointed at CC's real PushPress. At that
 
 ---
 
+## Q12 — Glofox attendance endpoint attribution
+
+**Status**: OPEN — verify before checkin.created goes live
+
+**Question**: When `POST /2.0/attendances` is called with `user_id`, `model: "events"`, `model_ids: [event_id]`, does Glofox mark attendance for THAT user, or does it find a matching booking on the event and mark attendance for whichever user owns that booking?
+
+**Context**: Direct probe 2026-05-11 found that the attendance endpoint uses a different request shape than bookings (plural `model_ids` array + `model: "events"` plural). After fixing the shape, the response showed a booking for a DIFFERENT user (Artem K) than the user_id we passed (Zach). It's unclear whether:
+1. The response shows the booking that WAS marked attended (= we attributed to the wrong person), or
+2. The response is incidentally listing existing bookings for the event while the actual attendance write went against the user_id we passed
+
+**How to resolve**:
+1. Pick a Glofox event with TWO known test users booked.
+2. Call `POST /2.0/attendances` with one specific user_id.
+3. Check Glofox dashboard / reports: which user got marked attended?
+4. If the wrong user: the endpoint must accept the booking_id directly (look for an alternative field name like `booking_id` or a booking-scoped endpoint), and checkin-created must look up the booking_id from event_log first.
+
+**Owner**: next implementation session, before checkin.created goes live.
+
+---
+
+## Q13 — Glofox doesn't expose "list user's memberships"
+
+**Status**: OPEN — limits cancel handlers
+
+**Question**: Is there any REST endpoint that lists a user's assigned memberships (including private/NOEQL)? If not, how can the bridge get the `userMembershipId` needed for `POST /v3.0/memberships/{userMembershipId}/cancel`?
+
+**Context**: Direct probe 2026-05-11 exhausted candidate endpoints. None work:
+- `/2.0/branches/{branchId}/users/{userId}/memberships` → 404 Route not found
+- `/2.0/users/{userId}/user-memberships` → 404
+- `/2.0/private-memberships?user_id=...` → 404
+- `/2.0/members/{userId}?private=any` → returns only the PRIMARY (PAYG) membership, even after a NOEQL purchase
+- `/2.0/memberships?user_id=...` → ignores filter, returns plan catalog
+- `purchaseMembership` response is `{success, message, message_code, status, invoice_id}` — **no userMembershipId in the response**
+
+The booking metadata has been seen to carry `metadata.service.id` matching a user_membership_id in some historical Marshall bookings, but recent bookings show `metadata: null`. Not a reliable source.
+
+**Impact**: cancel handlers (`enrollment.status.changed`, `enrollment.deleted`) can't auto-cancel any membership whose `userMembershipId` we don't have cached. Currently this is ALL 4 historical enrollments backfilled into `pushpress_enrollment_links` (DQ7 fallout).
+
+**Workaround in code**: cancel handlers gracefully return `status:'skipped'` with `error:'membership_not_uniquely_identified_in_glofox'` and trigger a Slack alert so ops can cancel manually in the Glofox dashboard.
+
+**How to resolve**:
+1. Email Glofox API support (`glofox.APISupport@abcfitness.com`) — ask for the canonical endpoint to list a user's assigned memberships (or for `purchaseMembership` to echo the new `userMembershipId`).
+2. As a stop-gap: have TSG ops manually populate `pushpress_enrollment_links.glofox_user_membership_id` by clicking through the Glofox dashboard for each user.
+3. Future enhancement: if Glofox webhooks become available, subscribe to membership-created and capture the ID from there.
+
+**Owner**: TSG ops to email Glofox; PR 4+ implementation when an answer comes back.
+
+---
+
+## OQ-1 (PR 3) — Glofox waitlist field doesn't trigger waitlist behavior
+
+**Status**: OPEN — handler gated off
+
+**Question**: How do we create a waitlist booking via Glofox's REST API? The `status: "WAITING"` field is accepted on `POST /2.3/branches/{branchId}/bookings` but doesn't trigger waitlist semantics — the response confirms `status: "BOOKED"` (confirmed, not waitlisted).
+
+**Context**: Direct probe 2026-05-11 with `{user_id, event_id, model, model_id, status: "WAITING", charge: false, pay_gym: false}` returned `success: true` but `Booking.status: "BOOKED"`. The waitlist flag was silently ignored.
+
+**Current state**: `reservation-waitlisted` handler is deployed but gated behind `GLOFOX_WAITLIST_VERIFIED=true` env var. Without that flag set, it returns `status:'skipped', error:'waitlist_field_unverified...'`. This prevents incorrect bookings while we figure out the right approach.
+
+**How to resolve**:
+1. Email Glofox API support for the correct waitlist endpoint / field name.
+2. Or: investigate a separate endpoint like `POST /2.3/branches/{branchId}/waitlist` or `POST /2.3/.../bookings/waitlist`.
+
+**Owner**: TSG ops to email Glofox; once verified, set `GLOFOX_WAITLIST_VERIFIED=true` in Supabase secrets.
+
+---
+
 ## Answered (archive)
 
-_None yet._
+### Q5 / DQ7 — partial answer (2026-05-11)
+
+`purchaseMembership` does NOT return a `userMembershipId` — only `{success, message, status, invoice_id}`. The 4 prior enrollment.created success rows all have `glofox_response.userMembershipId = null`. Confirmed via a fresh end-to-end purchase round-trip 2026-05-11. The fallback strategy (list user memberships and find the NOEQL) is also blocked — see Q13. Result: cancel handlers degrade gracefully but require manual ops follow-up in the Glofox dashboard.
+
+### Q1 / payment_method (2026-05-11)
+
+Resolved as `cash` (staff_only). Live DB and migration 0005 both reflect this.
+
+### Q9 / sauna filter (2026-05-11)
+
+Resolved with `SAUNA_CLASS_TYPE_ALLOWLIST` (reservations) + `SAUNA_PLAN_CATEGORY_ALLOWLIST` (enrollments). Empty list = filter everything (safe default). Set to `"Sauna"` in production.

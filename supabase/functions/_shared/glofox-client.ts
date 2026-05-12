@@ -239,14 +239,22 @@ export class GlofoxClient implements GlofoxClientShape {
   }
 
   async cancelBooking(bookingId: string): Promise<void> {
-    // DELETE returns 204 on success or 404 if already canceled — both fine.
+    // Glofox's DELETE returns 204 on success. For an already-canceled or
+    // non-existent booking, Glofox returns **400 BOOKING_NOT_FOUND** (verified
+    // 2026-05-11 via direct probe). It does NOT return 404 here, despite the
+    // semantic — Glofox tags missing-resource errors as 400 with a 200+
+    // success:false envelope, which our request() normalizes to GlofoxApiError
+    // status=400. We treat both as idempotent success.
     const path = `/2.3/branches/${this.cfg.branchId}/bookings/${
       encodeURIComponent(bookingId)
     }`;
     try {
       await this.request<unknown>("DELETE", path);
     } catch (err) {
-      if (err instanceof GlofoxApiError && err.status === 404) return;
+      if (err instanceof GlofoxApiError) {
+        if (err.status === 404) return;
+        if (err.status === 400 && /BOOKING_NOT_FOUND/i.test(err.message)) return;
+      }
       throw err;
     }
   }
@@ -387,9 +395,22 @@ export class GlofoxClient implements GlofoxClientShape {
     eventId: string;
     attendedAt: number;
   }): Promise<void> {
+    // Attendance uses a DIFFERENT input shape than bookings:
+    //   - model_ids (plural, ARRAY) not model_id (sing)
+    //   - model: "events" (plural) not "event" (sing)
+    // Verified 2026-05-11 via direct probe. Singular variants return
+    // "Invalid model or model_ids" or "The model is not implemented".
+    //
+    // SEMANTIC NOTE (also verified 2026-05-11): the attendance endpoint
+    // appears to resolve the booking server-side from (event, model_ids) and
+    // may attribute attendance to the wrong user when multiple bookings exist
+    // for the event. This needs end-to-end verification in TSG's dashboard
+    // before any checkin.created handler invocation can be trusted in
+    // production. Open question — see docs/open-questions.md (Q12, new).
     await this.request<unknown>("POST", "/2.0/attendances", {
       user_id: args.userId,
-      event_id: args.eventId,
+      model: "events",
+      model_ids: [args.eventId],
       attended_at: args.attendedAt,
     });
   }
