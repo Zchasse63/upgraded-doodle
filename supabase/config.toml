@@ -72,9 +72,10 @@ schedule = "0 6 * * *"
 # campaign to 43. Uses the Glofox dashboard internal API via a Bearer JWT
 # (GLOFOX_DASHBOARD_JWT) that expires every 24h — user must refresh via
 # scripts/update-glofox-jwt.ts. CRON_SECRET-protected like reconcile-cron.
-# Runs every 30 minutes for low-latency redemption detection.
+# Daily at 13:00 UTC (= 9 AM EDT, 8 AM EST) — a few hours after the user's
+# typical JWT refresh in the morning. Adjust if needed.
 verify_jwt = false
-schedule = "*/30 * * * *"
+schedule = "0 13 * * *"
 
 [analytics]
 enabled = false

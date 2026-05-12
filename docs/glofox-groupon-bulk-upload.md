@@ -240,8 +240,12 @@ A scheduled Edge Function that automates the "as codes get redeemed, upload the 
    ```toml
    [functions.groupon-rotate-cron]
    verify_jwt = false
-   schedule = "*/30 * * * *"  # every 30 min
+   schedule = "0 13 * * *"  # daily at 13:00 UTC (9 AM EDT / 8 AM EST)
    ```
+
+   Adjustable — if redemption volume grows and 24h latency is too long,
+   bump to `*/15 * * * *` (15 min) or `0 */6 * * *` (every 6h). Each
+   cron run is cheap (~2-3s, a handful of API calls).
 
 ### Daily operations
 
